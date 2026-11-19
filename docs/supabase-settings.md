@@ -57,4 +57,8 @@ All teammates and environments **must** keep the following settings identical be
 
 ## 5. Custom Access Token Hook (`OSP-58`)
 
-Once migration `OSP-58` is applied, enable the **Custom Access Token Hook** (`public.custom_access_token_hook`) in **Supabase Dashboard → Authentication → Hooks (Beta)** (or in `supabase/config.toml` under `[auth.hook.custom_access_token]`). This hook reads `role` from `public.user_profiles` and injects it as `user_role` into the JWT claims—never trusting client-mutable `raw_user_meta_data`.
+Migration [`supabase/migrations/20261119180000_osp58_auth_schema_and_token_hook.sql`](../supabase/migrations/20261119180000_osp58_auth_schema_and_token_hook.sql) creates `public.app_role`, `public.user_profiles`, `public.user_devices`, `public.audit_logs`, stub tables (`public.victim_records`, `public.rescuer_observations`), and the `public.custom_access_token_hook(event jsonb)` function:
+
+- **Role Source of Truth:** Reads `role` strictly from `public.user_profiles` where `is_active = true` and injects it into JWT claims as `user_role`. If the profile is missing or `is_active = false`, `user_role` is set to `null`. Client-editable `user_metadata` / `raw_user_meta_data` is never read.
+- **Function Hardening:** Declared `SECURITY DEFINER SET search_path = public`; `EXECUTE` is granted exclusively to `supabase_auth_admin` and revoked from `PUBLIC`, `anon`, and `authenticated`.
+- **Supabase Cloud Dashboard Activation:** After applying the migration, open **Authentication → Hooks → Customize Access Token (JWT) Claims hook**, select **Postgres Function**, choose schema `public` and function `custom_access_token_hook`, and click **Save**. Local CLI configuration is enabled in `supabase/config.toml` under `[auth.hook.custom_access_token]`.

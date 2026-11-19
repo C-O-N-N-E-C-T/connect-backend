@@ -29,7 +29,7 @@ enabled = true
 port = 54323
 api_url = "http://127.0.0.1"
 
-[inbucket]
+[local_smtp]
 enabled = true
 port = 54324
 
@@ -78,8 +78,7 @@ otp_expiry = 3600
 enable_signup = false
 enable_confirmations = false
 
-# Custom Access Token Hook (configured in OSP-58 migration `public.custom_access_token_hook`)
-# Uncomment or enable in OSP-58 once the SQL function is applied:
-# [auth.hook.custom_access_token]
-# enabled = true
-# uri = "pg-functions://postgres/public/custom_access_token_hook"
+# Custom Access Token Hook (OSP-58 — injects `user_role` from `public.user_profiles`)
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/custom_access_token_hook"
