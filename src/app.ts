@@ -2,18 +2,31 @@ import cors from 'cors';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import helmet from 'helmet';
 import { env } from './config/env.js';
+import { requireHttps } from './middleware/https.js';
+import { authRateLimiter } from './middleware/rate-limit.js';
 import { AppError, type ErrorResponsePayload } from './types/errors.js';
 
 export function createApp() {
   const app = express();
 
-  // Security headers
-  app.use(helmet());
+  // Trust the reverse proxy / edge (Render) so req.secure and req.ip are correct
+  app.set('trust proxy', env.TRUST_PROXY);
+
+  // Security headers, HSTS enforced for 1 year across subdomains
+  app.use(
+    helmet({
+      hsts: { maxAge: 31536000, includeSubDomains: true },
+    }),
+  );
+
+  // Reject plain HTTP in production (NFR-SEC-02, AC-19)
+  app.use(requireHttps);
 
   // Strict CORS configured from environment variable
   app.use(
     cors({
-      origin: env.CORS_ORIGIN,
+      // Array form: unlisted origins get no Access-Control-Allow-Origin header at all
+      origin: [env.CORS_ORIGIN],
       credentials: true,
     }),
   );
@@ -36,6 +49,9 @@ export function createApp() {
       version: 'v1',
     });
   });
+
+  // Rate limit all auth endpoints (OSP-64)
+  app.use('/api/v1/auth', authRateLimiter);
 
   // 404 handler following the Unified HTTP Error Contract
   app.use((_req: Request, res: Response<ErrorResponsePayload>) => {
