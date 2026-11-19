@@ -62,3 +62,14 @@ Migration [`supabase/migrations/20261119180000_osp58_auth_schema_and_token_hook.
 - **Role Source of Truth:** Reads `role` strictly from `public.user_profiles` where `is_active = true` and injects it into JWT claims as `user_role`. If the profile is missing or `is_active = false`, `user_role` is set to `null`. Client-editable `user_metadata` / `raw_user_meta_data` is never read.
 - **Function Hardening:** Declared `SECURITY DEFINER SET search_path = public`; `EXECUTE` is granted exclusively to `supabase_auth_admin` and revoked from `PUBLIC`, `anon`, and `authenticated`.
 - **Supabase Cloud Dashboard Activation:** After applying the migration, open **Authentication → Hooks → Customize Access Token (JWT) Claims hook**, select **Postgres Function**, choose schema `public` and function `custom_access_token_hook`, and click **Save**. Local CLI configuration is enabled in `supabase/config.toml` under `[auth.hook.custom_access_token]`.
+
+---
+
+## 6. 30-Day Data Retention Purge (`OSP-67`, `FR-B-06`, `AC-28`)
+
+Migration [`supabase/migrations/20261119200000_osp67_retention_purge_pg_cron.sql`](../supabase/migrations/20261119200000_osp67_retention_purge_pg_cron.sql) configures automated daily data retention for the backend PostgreSQL database:
+
+- **Function (`public.purge_expired_records()`):** Declared `SECURITY DEFINER SET search_path = public`. Computes `now() - interval '30 days'` against each record's `created_at` timestamp, deletes expired rows from `public.rescuer_observations` first and `public.victim_records` second (preserving foreign-key safety for Epic E8), and records a summary row in `public.audit_logs` with `action_type = 'RETENTION_PURGE'` and structured counts in `metadata`.
+- **Execution Security:** `EXECUTE` is revoked from `PUBLIC`, `anon`, and `authenticated`, and granted only to `service_role` (and `pg_cron` running as database owner).
+- **Schedule:** Enables `pg_cron` and idempotently registers job `purge-expired-records-daily` on schedule `'0 3 * * *'` (`03:00 UTC` daily).
+- **Scope Boundary:** Covers backend PostgreSQL tables (`FR-B-06`) only. Local SQLCipher/Room database purge on Android devices is implemented separately in Epic E8, and `audit_logs` immutability triggers are defined in `OSP-65`.
