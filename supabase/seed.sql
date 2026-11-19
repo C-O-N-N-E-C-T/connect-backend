@@ -1,0 +1,1 @@
+-- Supabase CLI seed SQL file (account seeding with bcrypt via Admin API is executed via `npm run seed` in OSP-59)

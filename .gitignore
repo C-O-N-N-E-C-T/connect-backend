@@ -1,0 +1,49 @@
+# ============================================================================
+# CONNECT Backend — Strict .gitignore (Public Repository Security Guard)
+# NEVER commit .env files, private keys, or credentials!
+# ============================================================================
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Build & TypeScript outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Testing & coverage
+coverage/
+.nyc_output/
+
+# Supabase local state & temp files
+.supabase/
+supabase/.branches/
+supabase/.temp/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Defensive cross-platform rules (Android / Keystore secrets)
+.gradle/
+local.properties
+*.keystore
+*.jks
+*.pem
+*.key

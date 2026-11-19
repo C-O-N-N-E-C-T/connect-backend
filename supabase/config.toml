@@ -1,0 +1,85 @@
+# ============================================================================
+# CONNECT — Supabase CLI Local Configuration (`supabase/config.toml`)
+# Issue: OSP-57 (Epic E10 — Authentication & Access Control)
+# ============================================================================
+
+project_id = "connect-backend"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[db.pooler]
+enabled = false
+port = 54329
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+
+[studio]
+enabled = true
+port = 54323
+api_url = "http://127.0.0.1"
+
+[inbucket]
+enabled = true
+port = 54324
+
+[storage]
+enabled = false
+file_size_limit = "50MiB"
+
+# ============================================================================
+# Auth Configuration (Locked in OSP-57 / SCRT-1 / SCRT-4-1 / WAPP-1)
+# ============================================================================
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+additional_redirect_urls = ["http://localhost:5173/**"]
+
+# Access token (JWT) expiry: 3600 seconds (1 hour)
+jwt_expiry = 3600
+
+# Refresh token rotation enabled with reuse detection window (10 seconds)
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+
+# Public self-registration is strictly DISABLED.
+# Accounts ('rescuer', 'coordinator', 'administrator') are provisioned exclusively
+# via administrator seed scripts (OSP-59) or the Administrator API (OSP-66).
+enable_signup = false
+
+# Anonymous sign-ins are strictly DISABLED (Victim/Relay modes operate 100% offline with zero auth).
+enable_anonymous_sign_ins = false
+
+# Password policy: minimum 10 characters, must include lowercase, uppercase, digits, and symbols
+minimum_password_length = 10
+password_requirements = "lower_upper_letters_digits_symbols"
+
+[auth.email]
+# Self sign-up is disabled above (`enable_signup = false`), while email/password login remains active.
+enable_signup = false
+double_confirm_changes = true
+enable_confirmations = true
+secure_password_change = true
+max_frequency = "1s"
+otp_length = 6
+otp_expiry = 3600
+
+[auth.sms]
+enable_signup = false
+enable_confirmations = false
+
+# Custom Access Token Hook (configured in OSP-58 migration `public.custom_access_token_hook`)
+# Uncomment or enable in OSP-58 once the SQL function is applied:
+# [auth.hook.custom_access_token]
+# enabled = true
+# uri = "pg-functions://postgres/public/custom_access_token_hook"
