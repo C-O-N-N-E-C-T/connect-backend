@@ -44,7 +44,17 @@ export interface AuditLog {
   device_id: string | null;
   action_type: AuditActionType | string;
   target_record_id: string | null;
+  metadata?: Record<string, unknown>;
   created_at: string;
+}
+
+export interface RetentionPurgeResult {
+  retention_days: number;
+  cutoff_at: string;
+  rescuer_observations_deleted: number;
+  victim_records_deleted: number;
+  total_deleted: number;
+  audit_log_id: string;
 }
 
 export interface VictimRecord {
