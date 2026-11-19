@@ -4,15 +4,20 @@ Node.js + Express + TypeScript backend API and Supabase CLI migrations for the *
 
 ## Quick Start
 
-1. **Install dependencies:**
+1. **Install Node.js & dependencies:**
+   Requires **Node.js `26.x` Active LTS** (fallback `24.x`; see `.nvmrc`).
    ```bash
-   npm install
+   npm ci
+   npx supabase --version
    ```
-2. **Configure environment variables:**
+2. **Configure & verify environment variables:**
    ```bash
    cp .env.example .env
    ```
-   Fill in `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` in `.env` (never commit `.env`).
+   Fill in `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, and `DATABASE_URL` in `.env` (never commit `.env`), then verify your local setup:
+   ```bash
+   node scripts/check-env.mjs
+   ```
 3. **Run in development mode:**
    ```bash
    npm run dev
