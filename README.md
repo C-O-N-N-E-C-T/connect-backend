@@ -17,7 +17,13 @@ Node.js + Express + TypeScript backend API and Supabase CLI migrations for the *
    ```bash
    npm run dev
    ```
-4. **Run tests & typecheck:**
+4. **Seed pre-provisioned accounts (`OSP-59`, idempotent):**
+   Fill `SEED_*` email and password variables in `.env`, then run:
+   ```bash
+   npm run seed
+   ```
+   This provisions the `'administrator'`, `'coordinator'`, and `'rescuer'` accounts via Supabase Auth Admin API (`email_confirm: true`, `app_metadata.role`) and upserts their `public.user_profiles` rows. Re-running `npm run seed` produces no duplicates or errors.
+5. **Run tests & typecheck:**
    ```bash
    npm run typecheck
    npm test
