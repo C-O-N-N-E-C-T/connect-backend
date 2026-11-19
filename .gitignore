@@ -40,6 +40,9 @@ Thumbs.db
 !.vscode/extensions.json
 .idea/
 
+# Project documents (SoW is internal; keep out of the public repo)
+CONNECT_SOW*.docx
+
 # Defensive cross-platform rules (Android / Keystore secrets)
 .gradle/
 local.properties

@@ -9,6 +9,7 @@ export type ErrorCode =
   | 'DEVICE_REVOKED'
   | 'ACCOUNT_DISABLED'
   | 'RATE_LIMITED'
+  | 'HTTPS_REQUIRED'
   | 'VALIDATION_ERROR'
   | 'NOT_FOUND'
   | 'INTERNAL_ERROR';
