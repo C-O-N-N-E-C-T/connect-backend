@@ -716,6 +716,35 @@ describe('OSP-61 R1: classification through the real auth-js getClaims (fake fet
     expectError(res, 500, 'INTERNAL_ERROR');
   });
 
+  // Unique kid: the JWKS cache in auth-js is process-wide.
+  const ALG_TEST_KID = 'osp61-alg-test-kid';
+  const jwksWithKid = async () =>
+    jsonResponse(200, {
+      keys: [{ kid: ALG_TEST_KID, kty: 'EC', crv: 'P-256', x: 'AAAA', y: 'AAAA', alg: 'ES256' }],
+    });
+
+  it.each(['none', 'PS512', 'EdDSA'])(
+    'alg %s with a kid present in JWKS -> rejected locally -> 401 UNAUTHENTICATED',
+    async (alg) => {
+      const fakeFetch = vi.fn(jwksWithKid);
+      const res = await call(
+        fakeFetch as unknown as typeof fetch,
+        unverifiedToken({ alg, kid: ALG_TEST_KID, typ: 'JWT' }),
+      );
+      expectError(res, 401, 'UNAUTHENTICATED');
+      for (const [url] of fakeFetch.mock.calls as unknown as Array<[string]>) {
+        expect(String(url)).not.toMatch(/\/auth\/v1\/user$/);
+      }
+    },
+  );
+
+  it('alg none without kid -> getUser fallback rejects -> 401 UNAUTHENTICATED', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(401, { code: 'bad_jwt', message: 'invalid JWT' }));
+    const res = await call(fakeFetch as unknown as typeof fetch, unverifiedToken({ alg: 'none', typ: 'JWT' }));
+    expectError(res, 401, 'UNAUTHENTICATED');
+    expect(String((fakeFetch.mock.calls[0] as unknown as [string])[0])).toMatch(/\/auth\/v1\/user$/);
+  });
+
   it('JWKS endpoint 503 (asymmetric token) -> 500 INTERNAL_ERROR', async () => {
     const fakeFetch = vi.fn(async () => jsonResponse(503, { message: 'unavailable' }));
     const res = await call(fakeFetch as unknown as typeof fetch, esToken());
