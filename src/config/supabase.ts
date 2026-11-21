@@ -53,10 +53,20 @@ export function createTokenVerifierClient(
 ): SupabaseClient {
   const baseFetch = options.fetch ?? fetch;
   const timeoutMs = options.timeoutMs ?? AUTH_VERIFY_TIMEOUT_MS;
-  const fetchWithTimeout: typeof fetch = (input, init) => {
+  const fetchWithTimeout: typeof fetch = async (input, init) => {
     const timeout = AbortSignal.timeout(timeoutMs);
     const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
-    return baseFetch(input, { ...init, signal });
+    const res = await baseFetch(input, { ...init, signal });
+    // Auth/JWKS unavailable (429, any 5xx): fail like a network error. auth-js 2.119 turns a
+    // rejected fetch into AuthRetryableFetchError (status 0) on both the JWKS fetch and the
+    // getUser fallback, with no retry, so the guard answers 500 instead of 401. Without this a
+    // non-JSON body (e.g. an edge/CDN HTML page) on 429 or 505-511 becomes AuthUnknownError,
+    // the status is lost and the token would be reported as invalid (401).
+    if (res.status === 429 || res.status >= 500) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new TypeError(`Auth service unavailable (HTTP ${res.status})`);
+    }
+    return res;
   };
 
   return createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {

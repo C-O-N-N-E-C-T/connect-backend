@@ -844,6 +844,54 @@ describe('OSP-61 R1: classification through the real auth-js getClaims (fake fet
       /\/\.well-known\/jwks\.json$/,
     );
   });
+
+  // L1: non-JSON 429 / 505-511 bodies made auth-js throw AuthUnknownError (status lost -> 401).
+  const html = (status: number) => async () =>
+    new Response('<html><body>edge error</body></html>', {
+      status,
+      headers: { 'Content-Type': 'text/html' },
+    });
+
+  it.each([429, 505, 507, 511])(
+    'getUser fallback: HTML %s -> 500 INTERNAL_ERROR, Auth called once',
+    async (status) => {
+      const fakeFetch = vi.fn(html(status));
+      const res = await call(fakeFetch as unknown as typeof fetch);
+      expectError(res, 500, 'INTERNAL_ERROR');
+      expect(res.headers['www-authenticate']).toBeUndefined();
+      expect(fakeFetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([429, 505])('JWKS path: HTML %s -> 500 INTERNAL_ERROR, JWKS called once', async (status) => {
+    const fakeFetch = vi.fn(html(status));
+    const res = await call(fakeFetch as unknown as typeof fetch, esToken());
+    expectError(res, 500, 'INTERNAL_ERROR');
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+    expect(String((fakeFetch.mock.calls[0] as unknown as [string])[0])).toMatch(
+      /\/\.well-known\/jwks\.json$/,
+    );
+  });
+
+  it.each([
+    ['JSON 429', 429],
+    ['JSON 503', 503],
+  ])('getUser fallback: %s still -> 500 INTERNAL_ERROR', async (_name, status) => {
+    const fakeFetch = vi.fn(async () => jsonResponse(status, { message: 'unavailable' }));
+    expectError(await call(fakeFetch as unknown as typeof fetch), 500, 'INTERNAL_ERROR');
+  });
+
+  it.each([
+    ['JSON 401', 401, true],
+    ['JSON 403', 403, true],
+    ['HTML 401', 401, false],
+    ['HTML 404', 404, false],
+  ])('getUser fallback: Auth %s still -> 401 UNAUTHENTICATED', async (_name, status, json) => {
+    const fakeFetch = vi.fn(
+      json ? async () => jsonResponse(status, { code: 'bad_jwt', message: 'invalid JWT' }) : html(status),
+    );
+    expectError(await call(fakeFetch as unknown as typeof fetch), 401, 'UNAUTHENTICATED');
+  });
 });
 
 describe('OSP-61 R7: aud claim must be "authenticated"', () => {
