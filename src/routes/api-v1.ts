@@ -1,13 +1,50 @@
-import express, { Router, type Request, type Response } from 'express';
+import express, {
+  Router,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from 'express';
 import type { AuthGuard } from '../middleware/auth.js';
-import type { ErrorResponsePayload } from '../types/errors.js';
+import { AppError, type ErrorResponsePayload } from '../types/errors.js';
+
+const parseJson = express.json({ limit: '1mb' });
+
+/**
+ * Generic 400 for every client-side body error; the parser's own message is never sent (it can
+ * contain body content or zlib internals).
+ */
+export const invalidBodyError = () =>
+  new AppError(
+    400,
+    'VALIDATION_ERROR',
+    'The request body is malformed, too large or uses an unsupported encoding.',
+  );
 
 /**
  * JSON body parser. Protected routes get it AFTER the auth guard (see app.ts), so requests
  * without a valid token are rejected with 401 before any body is read. A public route that
  * needs a body adds it to its own route chain.
+ *
+ * Classification by origin, not by error shape: an error that body-parser itself passes to
+ * `next` with a 4xx `status`/`statusCode` is a client body error and becomes
+ * 400 VALIDATION_ERROR. That covers invalid JSON, a too-large body, an unsupported charset or
+ * content encoding, an aborted request, and a corrupt gzip/deflate/br body (a zlib error that
+ * body-parser wraps as 400 without a `type`). Errors with any other status (raw-body's 500s
+ * for stream misuse) pass through unchanged. Errors thrown by route handlers never pass
+ * through here, so they cannot be misreported as body errors.
  */
-export const jsonBody = express.json({ limit: '1mb' });
+export const jsonBody: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
+  parseJson(req, res, (err?: unknown) => {
+    if (err === undefined || err === null) {
+      next();
+      return;
+    }
+    const { status, statusCode } = err as { status?: unknown; statusCode?: unknown };
+    const code = typeof status === 'number' ? status : statusCode;
+    next(typeof code === 'number' && code >= 400 && code < 500 ? invalidBodyError() : err);
+  });
+};
 
 /**
  * PUBLIC /api/v1 routes: reachable WITHOUT an access token. Only the health check and the

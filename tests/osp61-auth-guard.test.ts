@@ -1,3 +1,4 @@
+import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 import express, { type Request, type Response } from 'express';
 import request from 'supertest';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -607,6 +608,95 @@ describe('OSP-61 R3: body parsing runs after the guard; parser errors -> 400', (
       .post('/api/v1/auth/session')
       .send({ device_id: DEVICE_ID, device_name: 'phone' });
     expectError(ok, 404, 'NOT_FOUND');
+  });
+});
+
+describe('OSP-61 M1: corrupt compressed bodies -> 400 VALIDATION_ERROR, handler errors untouched', () => {
+  const corruptBody = '{"a":1}'; // declared as compressed but sent as plain text
+  const zlibMessages = /incorrect header check|Decompression failed|unexpected end|invalid|zlib|header/i;
+
+  function appWithFakes() {
+    return createApp({
+      authGuardDeps: {
+        authClient: { auth: { getClaims } } as unknown as AuthGuardDeps['authClient'],
+        dbClient: createFakeDbClient(db),
+      },
+      registerProtectedRoutes: (router) => {
+        router.post('/test/echo', (req: Request, res: Response) => {
+          res.status(200).json({ body: req.body });
+        });
+        router.post('/test/throws-parser-shaped', () => {
+          // Looks exactly like a body-parser error, but comes from a handler.
+          throw Object.assign(new Error('handler failure'), {
+            status: 400,
+            statusCode: 400,
+            expose: true,
+            type: 'entity.parse.failed',
+          });
+        });
+      },
+    });
+  }
+
+  it.each(['gzip', 'deflate', 'br'])(
+    'public POST /api/v1/auth/session without token, corrupt %s body -> 400',
+    async (encoding) => {
+      const res = await request(createApp())
+        .post('/api/v1/auth/session')
+        .set('Content-Type', 'application/json')
+        .set('Content-Encoding', encoding)
+        .send(corruptBody);
+      expectError(res, 400, 'VALIDATION_ERROR');
+      expect(res.body.message).not.toMatch(zlibMessages);
+    },
+  );
+
+  it.each(['gzip', 'deflate', 'br'])(
+    'protected route with a valid token, corrupt %s body -> 400',
+    async (encoding) => {
+      const res = await request(appWithFakes())
+        .post('/api/v1/test/echo')
+        .set('Authorization', `Bearer ${TOKEN}`)
+        .set('Content-Type', 'application/json')
+        .set('Content-Encoding', encoding)
+        .send(corruptBody);
+      expectError(res, 400, 'VALIDATION_ERROR');
+      expect(res.body.message).not.toMatch(zlibMessages);
+    },
+  );
+
+  it('protected route without a token, corrupt gzip body -> 401 (guard runs first)', async () => {
+    const res = await request(createApp())
+      .post('/api/v1/victims')
+      .set('Content-Type', 'application/json')
+      .set('Content-Encoding', 'gzip')
+      .send(corruptBody);
+    expectError(res, 401, 'UNAUTHENTICATED');
+  });
+
+  it.each([
+    ['gzip', gzipSync],
+    ['deflate', deflateSync],
+    ['br', brotliCompressSync],
+  ] as const)('a correctly %s-compressed JSON body is still parsed', async (encoding, compress) => {
+    const res = await request(appWithFakes())
+      .post('/api/v1/test/echo')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .set('Content-Type', 'application/json')
+      .set('Content-Encoding', encoding)
+      // Send the Buffer as-is (superagent would otherwise JSON-serialize it).
+      .serialize((body: unknown) => body as string)
+      .send(compress(Buffer.from('{"hello":"world"}')));
+    expect(res.status).toBe(200);
+    expect(res.body.body).toEqual({ hello: 'world' });
+  });
+
+  it('a 400 parser-shaped error thrown by a handler is not reported as a body error', async () => {
+    const res = await request(appWithFakes())
+      .post('/api/v1/test/throws-parser-shaped')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send({ ok: true });
+    expectError(res, 500, 'INTERNAL_ERROR');
   });
 });
 

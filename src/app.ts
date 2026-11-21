@@ -89,16 +89,6 @@ export function createApp(options: AppOptions = {}) {
   return app;
 }
 
-/**
- * body-parser errors (invalid JSON, body too large, unsupported charset/encoding, aborted
- * request, ...) are http-errors with a string `type` and a 4xx `status`.
- */
-function isBodyParserError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const { type, status } = err as Error & { type?: unknown; status?: unknown };
-  return typeof type === 'string' && typeof status === 'number' && status >= 400 && status < 500;
-}
-
 /** Global error handler following the Unified HTTP Error Contract. */
 export function errorHandler(
   err: unknown,
@@ -114,15 +104,7 @@ export function errorHandler(
     return;
   }
 
-  // Client body errors: generic message, never the parser's own (it can echo body content).
-  if (isBodyParserError(err)) {
-    res.status(400).json({
-      error_code: 'VALIDATION_ERROR',
-      message: 'The request body is malformed, too large or uses an unsupported encoding.',
-    });
-    return;
-  }
-
+  // Body parser errors arrive here already mapped to AppError 400 by `jsonBody`.
   const message =
     err instanceof Error && env.NODE_ENV !== 'production'
       ? err.message
