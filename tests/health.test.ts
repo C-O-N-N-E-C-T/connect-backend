@@ -14,8 +14,9 @@ describe('OSP-57: Backend Skeleton & Environment Loader', () => {
     });
   });
 
+  // Paths outside /api/v1; unknown /api/v1 paths are behind the OSP-61 auth guard (401).
   it('Unknown routes return 404 following Unified HTTP Error Contract', async () => {
-    const res = await request(app).get('/api/v1/non-existent-route');
+    const res = await request(app).get('/non-existent-route');
     expect(res.status).toBe(404);
     expect(res.body).toEqual({
       error_code: 'NOT_FOUND',

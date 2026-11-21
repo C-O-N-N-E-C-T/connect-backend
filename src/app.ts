@@ -2,6 +2,7 @@ import cors from 'cors';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import helmet from 'helmet';
 import { env } from './config/env.js';
+import { requireAuth } from './middleware/auth.js';
 import { requireHttps } from './middleware/https.js';
 import { authRateLimiter } from './middleware/rate-limit.js';
 import { AppError, type ErrorResponsePayload } from './types/errors.js';
@@ -50,8 +51,19 @@ export function createApp() {
     });
   });
 
-  // Rate limit all auth endpoints (OSP-64)
+  // Rate limit all auth endpoints (OSP-64). Runs before the auth guard so that
+  // unauthenticated brute force against /api/v1/auth/* is still limited.
   app.use('/api/v1/auth', authRateLimiter);
+
+  // Stateful auth guard on everything under /api/v1 except the public routes (OSP-61).
+  // Unknown /api/v1 paths therefore answer 401 to unauthenticated callers instead of 404.
+  app.use('/api/v1', (req: Request, res: Response, next: NextFunction) => {
+    if (isPublicApiRoute(req)) {
+      next();
+      return;
+    }
+    requireAuth(req, res, next);
+  });
 
   // 404 handler following the Unified HTTP Error Contract
   app.use((_req: Request, res: Response<ErrorResponsePayload>) => {
@@ -61,35 +73,55 @@ export function createApp() {
     });
   });
 
-  // Global error handler following the Unified HTTP Error Contract
-  app.use(
-    (
-      err: unknown,
-      _req: Request,
-      res: Response<ErrorResponsePayload>,
-      _next: NextFunction,
-    ) => {
-      if (err instanceof AppError) {
-        res.status(err.statusCode).json({
-          error_code: err.errorCode,
-          message: err.message,
-        });
-        return;
-      }
-
-      const message =
-        err instanceof Error && env.NODE_ENV !== 'production'
-          ? err.message
-          : 'An unexpected internal server error occurred.';
-
-      res.status(500).json({
-        error_code: 'INTERNAL_ERROR',
-        message,
-      });
-    },
-  );
+  app.use(errorHandler);
 
   return app;
+}
+
+/**
+ * Routes under /api/v1 reachable without a token (OSP-61): the health check and the initial
+ * session binding (POST /api/v1/auth/session, implemented by OSP-60).
+ * Exact, case-sensitive match on method and full path (query string ignored). Express 5 routing
+ * itself is case-insensitive and ignores one trailing slash, so variants like
+ * `/api/v1/auth/session/` or `/API/V1/AUTH/SESSION` are NOT excluded and get the guard (fails
+ * closed); prefix look-alikes such as `/api/v1/auth/session-evil` are guarded too.
+ */
+const PUBLIC_API_ROUTES: ReadonlyArray<{ methods: readonly string[]; path: string }> = [
+  { methods: ['GET', 'HEAD'], path: '/api/v1/health' },
+  { methods: ['POST'], path: '/api/v1/auth/session' },
+];
+
+export function isPublicApiRoute(req: Request): boolean {
+  const fullPath = `${req.baseUrl}${req.path}`;
+  return PUBLIC_API_ROUTES.some(
+    (route) => route.path === fullPath && route.methods.includes(req.method),
+  );
+}
+
+/** Global error handler following the Unified HTTP Error Contract. */
+export function errorHandler(
+  err: unknown,
+  _req: Request,
+  res: Response<ErrorResponsePayload>,
+  _next: NextFunction,
+) {
+  if (err instanceof AppError) {
+    res.status(err.statusCode).json({
+      error_code: err.errorCode,
+      message: err.message,
+    });
+    return;
+  }
+
+  const message =
+    err instanceof Error && env.NODE_ENV !== 'production'
+      ? err.message
+      : 'An unexpected internal server error occurred.';
+
+  res.status(500).json({
+    error_code: 'INTERNAL_ERROR',
+    message,
+  });
 }
 
 export const app = createApp();
