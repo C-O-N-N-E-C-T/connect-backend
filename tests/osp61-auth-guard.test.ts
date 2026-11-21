@@ -2,10 +2,19 @@ import express, { type Request, type Response } from 'express';
 import request from 'supertest';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { app, errorHandler } from '../src/app.js';
-import { createSupabaseRequestClient } from '../src/config/supabase.js';
 import {
+  AuthApiError,
+  AuthInvalidJwtError,
+  AuthRetryableFetchError,
+  AuthSessionMissingError,
+  AuthUnknownError,
+} from '@supabase/supabase-js';
+import { createTokenVerifierClient } from '../src/config/supabase.js';
+import {
+  createAuthGuard,
   createRequireAuth,
   extractBearerToken,
+  verifyAccessToken,
   type AuthGuardDeps,
 } from '../src/middleware/auth.js';
 import type { UserDevice, UserProfile } from '../src/types/database.js';
@@ -94,6 +103,7 @@ function claims(overrides: Record<string, unknown> = {}): Record<string, unknown
     session_id: SESSION_ID,
     iat: REVOKED_AT_SECONDS + 60,
     exp: REVOKED_AT_SECONDS + 3660,
+    aud: 'authenticated',
     role: 'authenticated',
     // The JWT role claim must be ignored in favour of user_profiles.role.
     user_role: 'administrator',
@@ -228,7 +238,7 @@ describe('OSP-61: token verification (getClaims)', () => {
   });
 
   describe('with the real auth-js getClaims (no network reached)', () => {
-    const realVerifier = createSupabaseRequestClient();
+    const realVerifier = createTokenVerifierClient();
     const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
 
     it('401 UNAUTHENTICATED for a malformed token that makes getClaims throw', async () => {
@@ -433,5 +443,204 @@ describe('OSP-61: guard mounting in the real app', () => {
 
   it('GET /health stays public', async () => {
     expect((await request(app).get('/health')).status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes R1, R7, R10, R11, R13
+// ---------------------------------------------------------------------------
+
+const b64url = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+/** Unexpired, unsigned test token: the real getClaims must still ask the Auth server about it. */
+function unverifiedToken(header: Record<string, unknown>, payload: Record<string, unknown> = {}) {
+  return [
+    b64url(header),
+    b64url(claims({ iat: nowSeconds() - 10, exp: nowSeconds() + 3600, ...payload })),
+    Buffer.from('signature').toString('base64url'),
+  ].join('.');
+}
+
+const jsonResponse = (status: number, body: unknown) =>
+  new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+
+describe('OSP-61 R1: Auth service unavailable -> 500, token rejected -> 401 (fake getClaims)', () => {
+  it.each([
+    ['AuthRetryableFetchError (network, status 0)', new AuthRetryableFetchError('fetch failed', 0)],
+    ['AuthRetryableFetchError (503)', new AuthRetryableFetchError('Service Unavailable', 503)],
+    ['AuthApiError 429', new AuthApiError('rate limited', 429, 'over_request_rate_limit')],
+    ['AuthApiError 500', new AuthApiError('server error', 500, undefined)],
+    ['AuthApiError 507', new AuthApiError('insufficient storage', 507, undefined)],
+  ])('returned %s -> 500 INTERNAL_ERROR', async (_name, error) => {
+    getClaims.mockResolvedValueOnce({ data: null, error });
+    const res = await callProtected();
+    expectError(res, 500, 'INTERNAL_ERROR');
+    expect(res.headers['www-authenticate']).toBeUndefined();
+    expect(db.queries).toHaveLength(0);
+  });
+
+  it('thrown AuthRetryableFetchError -> 500 INTERNAL_ERROR', async () => {
+    getClaims.mockRejectedValueOnce(new AuthRetryableFetchError('fetch failed', 0));
+    expectError(await callProtected(), 500, 'INTERNAL_ERROR');
+  });
+
+  it.each([
+    ['AuthInvalidJwtError', new AuthInvalidJwtError('Invalid JWT signature')],
+    ['AuthApiError 401', new AuthApiError('invalid JWT', 401, 'bad_jwt')],
+    ['AuthApiError 403', new AuthApiError('forbidden', 403, 'bad_jwt')],
+    ['AuthApiError 400', new AuthApiError('bad request', 400, undefined)],
+    ['AuthSessionMissingError', new AuthSessionMissingError()],
+    ['AuthUnknownError', new AuthUnknownError('unparseable', new SyntaxError('x'))],
+  ])('returned %s -> 401 UNAUTHENTICATED', async (_name, error) => {
+    getClaims.mockResolvedValueOnce({ data: null, error });
+    expectError(await callProtected(), 401, 'UNAUTHENTICATED');
+  });
+});
+
+describe('OSP-61 R1: classification through the real auth-js getClaims (fake fetch)', () => {
+  const hsToken = () => unverifiedToken({ alg: 'HS256', typ: 'JWT' });
+  const esToken = () => unverifiedToken({ alg: 'ES256', kid: 'unknown-kid', typ: 'JWT' });
+
+  function appWithFetch(fakeFetch: typeof fetch, timeoutMs?: number) {
+    return buildTestApp(createTokenVerifierClient({ fetch: fakeFetch, timeoutMs }));
+  }
+
+  async function call(fakeFetch: typeof fetch, token = hsToken(), timeoutMs?: number) {
+    return request(appWithFetch(fakeFetch, timeoutMs))
+      .get('/protected')
+      .set('Authorization', `Bearer ${token}`);
+  }
+
+  it('getUser fallback: Auth server accepts the token -> claims trusted -> 200', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(200, { id: USER_ID, aud: 'authenticated' }));
+    const res = await call(fakeFetch as unknown as typeof fetch);
+    expect(res.status).toBe(200);
+    expect(res.body.auth.user_id).toBe(USER_ID);
+    const [url, init] = fakeFetch.mock.calls[0] as unknown as [string, RequestInit];
+    expect(String(url)).toMatch(/\/auth\/v1\/user$/);
+    expect(new Headers(init.headers).get('Authorization')).toMatch(/^Bearer /);
+  });
+
+  it.each([
+    ['network error (fetch rejects)', async () => Promise.reject(new TypeError('fetch failed'))],
+    ['503 JSON', async () => jsonResponse(503, { message: 'unavailable' })],
+    ['502 HTML', async () => new Response('<html>bad gateway</html>', { status: 502 })],
+    ['429 JSON', async () => jsonResponse(429, { code: 'over_request_rate_limit', message: 'slow down' })],
+  ])('getUser fallback: %s -> 500 INTERNAL_ERROR', async (_name, impl) => {
+    expectError(await call(vi.fn(impl) as unknown as typeof fetch), 500, 'INTERNAL_ERROR');
+  });
+
+  it.each([
+    ['401 bad_jwt', async () => jsonResponse(401, { code: 'bad_jwt', message: 'invalid JWT' })],
+    ['403 bad_jwt', async () => jsonResponse(403, { code: 'bad_jwt', message: 'invalid JWT' })],
+    ['403 session_not_found', async () =>
+      jsonResponse(403, { code: 'session_not_found', message: 'Session not found' })],
+  ])('getUser fallback: %s -> 401 UNAUTHENTICATED', async (_name, impl) => {
+    const res = await call(vi.fn(impl) as unknown as typeof fetch);
+    expectError(res, 401, 'UNAUTHENTICATED');
+    expect(res.headers['www-authenticate']).toBe('Bearer');
+  });
+
+  it('timeout of a hung Auth server -> 500 INTERNAL_ERROR', async () => {
+    const hang = vi.fn(
+      (_input: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        }),
+    );
+    const res = await call(hang as unknown as typeof fetch, hsToken(), 50);
+    expectError(res, 500, 'INTERNAL_ERROR');
+  });
+
+  it('JWKS endpoint 503 (asymmetric token) -> 500 INTERNAL_ERROR', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(503, { message: 'unavailable' }));
+    const res = await call(fakeFetch as unknown as typeof fetch, esToken());
+    expectError(res, 500, 'INTERNAL_ERROR');
+    expect(String((fakeFetch.mock.calls[0] as unknown as [string])[0])).toMatch(
+      /\/\.well-known\/jwks\.json$/,
+    );
+  });
+});
+
+describe('OSP-61 R7: aud claim must be "authenticated"', () => {
+  it.each([
+    ['missing', undefined],
+    ['anon', 'anon'],
+    ['service_role', 'service_role'],
+    ['array without authenticated', ['other']],
+    ['number', 1],
+  ])('aud %s -> 401 UNAUTHENTICATED', async (_name, aud) => {
+    const value = claims({ aud });
+    if (aud === undefined) delete value.aud;
+    getClaims.mockResolvedValueOnce(claimsOk(value));
+    expectError(await callProtected(), 401, 'UNAUTHENTICATED');
+    expect(db.queries).toHaveLength(0);
+  });
+
+  it('aud as an array containing "authenticated" is accepted', async () => {
+    getClaims.mockResolvedValueOnce(claimsOk(claims({ aud: ['authenticated'] })));
+    expect((await callProtected()).status).toBe(200);
+  });
+});
+
+describe('OSP-61 R13: WWW-Authenticate on 401 only', () => {
+  it('401 responses carry WWW-Authenticate: Bearer', async () => {
+    expect((await callProtected({})).headers['www-authenticate']).toBe('Bearer');
+    expect(
+      (await callProtected({ Authorization: 'Bearer forged.token.value' })).headers['www-authenticate'],
+    ).toBe('Bearer');
+  });
+
+  it('403 and 200 responses do not', async () => {
+    db.tables.user_profiles = [profile({ is_active: false })];
+    expect((await callProtected()).headers['www-authenticate']).toBeUndefined();
+    db.tables.user_profiles = [profile()];
+    expect((await callProtected()).headers['www-authenticate']).toBeUndefined();
+  });
+});
+
+describe('OSP-61 R10: reusable verification stages', () => {
+  it('verifyAccessToken returns the verified claims', async () => {
+    const guard = createAuthGuard({
+      authClient: { auth: { getClaims } } as unknown as AuthGuardDeps['authClient'],
+      dbClient: createFakeDbClient(db),
+    });
+    await expect(guard.verifyAccessToken(TOKEN)).resolves.toMatchObject({
+      sub: USER_ID,
+      session_id: SESSION_ID,
+      aud: 'authenticated',
+    });
+    await expect(guard.verifyAccessToken('forged')).rejects.toMatchObject({
+      statusCode: 401,
+      errorCode: 'UNAUTHENTICATED',
+    });
+    await expect(guard.verifyAuthorizationHeader(undefined)).rejects.toMatchObject({ statusCode: 401 });
+    await expect(guard.loadActiveProfile(await guard.verifyAccessToken(TOKEN))).resolves.toMatchObject({
+      role: 'rescuer',
+    });
+  });
+
+  it('the default verifyAccessToken rejects garbage locally (no network)', async () => {
+    await expect(verifyAccessToken('not-a-jwt')).rejects.toMatchObject({ statusCode: 401 });
+  });
+});
+
+describe('OSP-61 R11: errors after successful authentication are not swallowed', () => {
+  it('an error thrown by next() rejects the middleware promise (Express forwards it)', async () => {
+    const requireAuth = createRequireAuth({
+      authClient: { auth: { getClaims } } as unknown as AuthGuardDeps['authClient'],
+      dbClient: createFakeDbClient(db),
+    });
+    const req = { headers: { authorization: `Bearer ${TOKEN}` } } as unknown as Request;
+    const res = { set: vi.fn() } as unknown as Response;
+    const next = vi.fn(() => {
+      throw new Error('downstream boom');
+    });
+    const result = requireAuth(req, res, next) as unknown;
+    expect(result).toBeInstanceOf(Promise);
+    await expect(result).rejects.toThrow('downstream boom');
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next).toHaveBeenCalledWith();
   });
 });

@@ -1,7 +1,11 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
-import type { SupabaseClient } from '@supabase/supabase-js';
+import {
+  isAuthApiError,
+  isAuthRetryableFetchError,
+  type SupabaseClient,
+} from '@supabase/supabase-js';
 import { z } from 'zod';
-import { createSupabaseRequestClient, supabaseAdmin } from '../config/supabase.js';
+import { createTokenVerifierClient, supabaseAdmin } from '../config/supabase.js';
 import type { UserDevice, UserProfile } from '../types/database.js';
 import { AppError } from '../types/errors.js';
 import type { AuthContext } from '../types/express.js';
@@ -20,21 +24,35 @@ export interface AuthGuardDeps {
 const UNAUTHENTICATED_MESSAGE = 'Authentication is required. Provide a valid Bearer access token.';
 const INTERNAL_MESSAGE = 'An unexpected internal server error occurred.';
 
-const unauthenticated = () => new AppError(401, 'UNAUTHENTICATED', UNAUTHENTICATED_MESSAGE);
-// Generic message only: the PostgREST error must not reach the client (the global handler
+export const unauthenticatedError = () =>
+  new AppError(401, 'UNAUTHENTICATED', UNAUTHENTICATED_MESSAGE);
+// Generic message only: the upstream error must not reach the client (the global handler
 // would echo err.message for non-AppError errors outside production).
 const internalError = () => new AppError(500, 'INTERNAL_ERROR', INTERNAL_MESSAGE);
 
+/** Supabase emits `aud: "authenticated"`; an array form containing it is accepted too. */
+const AUTHENTICATED_AUDIENCE = 'authenticated';
+
 /**
- * Claims the guard relies on. `sub` and `session_id` are UUIDs in Supabase Auth tokens; anon /
- * service-role API keys have neither, so they are rejected here. Validating the UUID format also
- * keeps malformed values away from the uuid columns (which would otherwise surface as a 500).
+ * Claims the guard relies on. `sub` and `session_id` are UUIDs in Supabase Auth access tokens;
+ * anon / service-role API keys have neither and a different `aud`, so they are rejected here.
+ * Validating the UUID format also keeps malformed values away from the uuid columns.
  */
-const requiredClaimsSchema = z.object({
+const verifiedClaimsSchema = z.object({
   sub: z.string().uuid(),
   session_id: z.string().uuid(),
   iat: z.number().finite(),
+  aud: z.union([
+    z.literal(AUTHENTICATED_AUDIENCE),
+    z.array(z.string()).refine((aud) => aud.includes(AUTHENTICATED_AUDIENCE)),
+  ]),
 });
+
+/** Claims of an access token that passed `getClaims` and the claim checks above. */
+export type VerifiedClaims = z.infer<typeof verifiedClaimsSchema>;
+
+type ProfileRow = Pick<UserProfile, 'role' | 'is_active' | 'all_sessions_revoked_at'>;
+type DeviceRow = Pick<UserDevice, 'user_id' | 'device_id' | 'is_device_revoked'>;
 
 /**
  * Returns the token of an `Authorization: Bearer <token>` header, or null.
@@ -51,6 +69,23 @@ export function extractBearerToken(header: string | undefined): string | null {
 }
 
 /**
+ * Classifies a getClaims failure (auth-js 2.119.0) as "Auth service unavailable" (-> 500, fail
+ * closed, the client must not treat its session as dead) versus "token rejected" (-> 401):
+ * - AuthRetryableFetchError: fetch rejected (network error, our timeout; status 0) or the Auth /
+ *   JWKS endpoint answered 500-504 / 520-530                                        -> 500
+ * - AuthApiError with status 429 or >= 500 (rate limited / other server error)       -> 500
+ * - everything else -> 401: AuthInvalidJwtError (malformed, expired, bad signature),
+ *   AuthApiError 4xx (token rejected by the Auth server), AuthSessionMissingError
+ *   (session_not_found), AuthUnknownError (unparseable response, status unknown), and
+ *   non-Auth throws (JSON.parse of a garbage token, WebCrypto errors).
+ */
+export function isAuthServiceUnavailable(error: unknown): boolean {
+  if (isAuthRetryableFetchError(error)) return true;
+  if (isAuthApiError(error)) return error.status === 429 || error.status >= 500;
+  return false;
+}
+
+/**
  * Global revocation: a token is revoked when it was issued at or before `all_sessions_revoked_at`.
  * `iat` is whole epoch seconds (floored), so `iat * 1000 <= revokedAtMs` also rejects every token
  * issued earlier within the same second as the revocation (equal counts as revoked).
@@ -63,107 +98,155 @@ function isRevokedByGlobalSignOut(iat: number, allSessionsRevokedAt: string | nu
   return iat * 1000 <= revokedAtMs;
 }
 
-type ProfileRow = Pick<UserProfile, 'role' | 'is_active' | 'all_sessions_revoked_at'>;
-type DeviceRow = Pick<UserDevice, 'user_id' | 'device_id' | 'is_device_revoked'>;
-
 /**
- * OSP-61 stateful auth guard. Order of checks:
- *  1. Bearer header -> 401 UNAUTHENTICATED
- *  2. getClaims(token) + required claims -> 401 UNAUTHENTICATED
- *  3. user_profiles: missing / inactive / iat <= all_sessions_revoked_at -> 403 ACCOUNT_DISABLED
- *  4. user_devices by (session_id claim, user_id): missing -> 403 SESSION_NOT_BOUND,
- *     revoked -> 403 DEVICE_REVOKED
- *  5. req.auth = { user_id, role (from DB, not the JWT user_role claim), device_id, session_id }
- * Database errors fail closed with 500 INTERNAL_ERROR. Client-supplied device/session headers
- * are never read; the device lookup uses only the signed session_id claim. The token is never logged.
+ * OSP-61 auth stages. `requireAuth` composes all of them; `POST /api/v1/auth/session` (OSP-60,
+ * not guarded) should reuse `verifyAuthorizationHeader` + `loadActiveProfile` instead of
+ * re-implementing token verification. Every stage throws an AppError (401/403/500).
  */
-export function createRequireAuth(deps: AuthGuardDeps): RequestHandler {
-  async function authenticate(req: Request): Promise<AuthContext> {
-    const token = extractBearerToken(req.headers.authorization);
-    if (token === null) throw unauthenticated();
-
-    // getClaims(jwt) (auth-js 2.119): rejects an expired/missing `exp` locally, then
-    // - asymmetric alg with `kid` (+ WebCrypto): verifies the signature against the project
-    //   JWKS (`/.well-known/jwks.json`, cached in-process for 10 minutes);
-    // - symmetric (HS*) alg or no `kid`: falls back to `getUser(jwt)`, one Auth server round trip
-    //   per request.
-    // Only `exp` and the signature are checked (not iss/aud). It returns { error } for auth
-    // errors but can also THROW for malformed input (e.g. JSON.parse of a garbage segment), so
-    // every failure mode maps to 401. The token must be passed explicitly: without an argument
-    // getClaims reads the (non-persisted) client session instead.
+export function createAuthGuard(deps: AuthGuardDeps) {
+  /**
+   * Verifies an access token with getClaims and returns its checked claims.
+   * getClaims(jwt) (auth-js 2.119.0): rejects an expired/missing `exp` locally, then
+   * - asymmetric alg (RS256/ES256) with `kid` (+ WebCrypto): verifies the signature against the
+   *   project JWKS (`/.well-known/jwks.json`, cached in-process for 10 minutes);
+   * - symmetric (HS*) alg, no `kid` or unknown `kid`: falls back to `getUser(jwt)`, one Auth
+   *   server round trip per request.
+   * It checks only `exp` and the signature; `aud` is checked here. It returns { error } for auth
+   * errors but can also THROW for malformed input. The token must be passed explicitly: without
+   * an argument getClaims reads the (non-persisted) client session instead.
+   * Throws 401 UNAUTHENTICATED, or 500 INTERNAL_ERROR when the Auth service is unavailable.
+   */
+  async function verifyAccessToken(token: string): Promise<VerifiedClaims> {
     let claims: unknown;
     try {
       const { data, error } = await deps.authClient.auth.getClaims(token);
-      if (error || !data) throw unauthenticated();
+      if (error) {
+        throw isAuthServiceUnavailable(error) ? internalError() : unauthenticatedError();
+      }
+      if (!data) throw unauthenticatedError();
       claims = data.claims;
-    } catch {
-      throw unauthenticated();
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      throw isAuthServiceUnavailable(err) ? internalError() : unauthenticatedError();
     }
 
     // Nothing from the token is trusted before getClaims succeeded.
-    const parsedClaims = requiredClaimsSchema.safeParse(claims);
-    if (!parsedClaims.success) throw unauthenticated();
-    const { sub: userId, session_id: sessionId, iat } = parsedClaims.data;
+    const parsed = verifiedClaimsSchema.safeParse(claims);
+    if (!parsed.success) throw unauthenticatedError();
+    return parsed.data;
+  }
 
-    const profileResult = await deps.dbClient
+  /** `Authorization` header -> verified claims. Missing/malformed header -> 401. */
+  async function verifyAuthorizationHeader(header: string | undefined): Promise<VerifiedClaims> {
+    const token = extractBearerToken(header);
+    if (token === null) throw unauthenticatedError();
+    return verifyAccessToken(token);
+  }
+
+  /** Missing profile / is_active false / iat <= all_sessions_revoked_at -> 403 ACCOUNT_DISABLED. */
+  async function loadActiveProfile(claims: VerifiedClaims): Promise<ProfileRow> {
+    const { data: profile, error } = await deps.dbClient
       .from('user_profiles')
       .select('role, is_active, all_sessions_revoked_at')
-      .eq('id', userId)
+      .eq('id', claims.sub)
       .maybeSingle<ProfileRow>();
-    if (profileResult.error) throw internalError();
-    const profile = profileResult.data;
+    if (error) throw internalError();
     if (
       !profile ||
       profile.is_active !== true ||
-      isRevokedByGlobalSignOut(iat, profile.all_sessions_revoked_at)
+      isRevokedByGlobalSignOut(claims.iat, profile.all_sessions_revoked_at)
     ) {
       throw new AppError(403, 'ACCOUNT_DISABLED', 'This account has been disabled or signed out.');
     }
+    return profile;
+  }
 
-    // Filtering on user_id as well prevents a session bound to another user from matching.
-    // More than one row for the same (session_id, user_id) makes maybeSingle error -> 500
-    // (fail closed); OSP-60 must bind each session_id to exactly one device row.
-    const deviceResult = await deps.dbClient
+  /**
+   * Device row bound to the token's signed session_id claim (never a client header).
+   * Missing -> 403 SESSION_NOT_BOUND; revoked -> 403 DEVICE_REVOKED.
+   * Filtering on user_id as well prevents a session bound to another user from matching.
+   * More than one row for the same (session_id, user_id) makes maybeSingle error -> 500
+   * (fail closed); OSP-60 must bind each session_id to exactly one device row.
+   */
+  async function resolveBoundDevice(claims: VerifiedClaims): Promise<DeviceRow> {
+    const { data: device, error } = await deps.dbClient
       .from('user_devices')
       .select('user_id, device_id, is_device_revoked')
-      .eq('session_id', sessionId)
-      .eq('user_id', userId)
+      .eq('session_id', claims.session_id)
+      .eq('user_id', claims.sub)
       .maybeSingle<DeviceRow>();
-    if (deviceResult.error) throw internalError();
-    const device = deviceResult.data;
-    if (!device || device.user_id !== userId) {
+    if (error) throw internalError();
+    if (!device || device.user_id !== claims.sub) {
       throw new AppError(403, 'SESSION_NOT_BOUND', 'This session is not bound to a registered device.');
     }
     if (device.is_device_revoked !== false) {
       throw new AppError(403, 'DEVICE_REVOKED', 'This device has been revoked.');
     }
-
-    return { user_id: userId, role: profile.role, device_id: device.device_id, session_id: sessionId };
+    return device;
   }
 
-  return function requireAuth(req: Request, _res: Response, next: NextFunction): void {
-    authenticate(req).then(
-      (auth) => {
-        req.auth = auth;
-        next();
-      },
-      (err: unknown) => {
-        // Errors that are not AppError (e.g. a thrown network failure) fail closed with a generic 500.
-        next(err instanceof AppError ? err : internalError());
-      },
-    );
+  /**
+   * Order: Bearer header + getClaims (401) -> account (403 ACCOUNT_DISABLED) -> device
+   * (403 SESSION_NOT_BOUND / DEVICE_REVOKED) -> req.auth with the role from the DB (the JWT
+   * user_role claim is ignored). Database errors fail closed with 500. The token is never logged.
+   */
+  async function authenticate(req: Request): Promise<AuthContext> {
+    const claims = await verifyAuthorizationHeader(req.headers.authorization);
+    const profile = await loadActiveProfile(claims);
+    const device = await resolveBoundDevice(claims);
+    return {
+      user_id: claims.sub,
+      role: profile.role,
+      device_id: device.device_id,
+      session_id: claims.session_id,
+    };
+  }
+
+  const requireAuth: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
+    let auth: AuthContext;
+    try {
+      auth = await authenticate(req);
+    } catch (err) {
+      const appError = err instanceof AppError ? err : internalError();
+      // RFC 6750 §3; same value for every 401 cause.
+      if (appError.statusCode === 401) res.set('WWW-Authenticate', 'Bearer');
+      next(appError);
+      return;
+    }
+    // Outside the try so an error thrown downstream is not reported as an auth failure;
+    // Express 5 routes a rejected handler promise to the error handler.
+    req.auth = auth;
+    next();
+  };
+
+  return {
+    verifyAccessToken,
+    verifyAuthorizationHeader,
+    loadActiveProfile,
+    resolveBoundDevice,
+    requireAuth,
   };
 }
 
-/**
- * Token verification uses a single module-level client created with the anon key: verifying a
- * token needs no privileges (JWKS is public, the getUser fallback is authorised by the user's own
- * JWT), and one shared instance avoids a client allocation per request. Table reads use the
- * service-role `supabaseAdmin`, because RLS denies them to anon/authenticated by default.
- */
-const tokenVerifierClient = createSupabaseRequestClient();
+/** Shorthand used by tests and by callers that only need the middleware. */
+export function createRequireAuth(deps: AuthGuardDeps): RequestHandler {
+  return createAuthGuard(deps).requireAuth;
+}
 
-export const requireAuth: RequestHandler = createRequireAuth({
-  authClient: tokenVerifierClient,
+/**
+ * Default wiring: token verification uses one module-level anon-key client (no privileges
+ * needed, one shared instance, Auth calls time out); table reads use the service-role
+ * `supabaseAdmin`, because RLS denies them to anon/authenticated.
+ */
+export const defaultAuthGuardDeps: AuthGuardDeps = {
+  authClient: createTokenVerifierClient(),
   dbClient: supabaseAdmin,
-});
+};
+
+export const {
+  verifyAccessToken,
+  verifyAuthorizationHeader,
+  loadActiveProfile,
+  resolveBoundDevice,
+  requireAuth,
+} = createAuthGuard(defaultAuthGuardDeps);
