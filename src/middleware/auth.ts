@@ -245,6 +245,9 @@ export function createAuthGuard(deps: AuthGuardDeps) {
   };
 }
 
+/** One guard instance: the stages plus `requireAuth`, all bound to the same deps. */
+export type AuthGuard = ReturnType<typeof createAuthGuard>;
+
 /** Shorthand used by tests and by callers that only need the middleware. */
 export function createRequireAuth(deps: AuthGuardDeps): RequestHandler {
   return createAuthGuard(deps).requireAuth;
@@ -260,10 +263,13 @@ export const defaultAuthGuardDeps: AuthGuardDeps = {
   dbClient: supabaseAdmin,
 };
 
+/** The single production guard instance; `createApp()` without options uses exactly this one. */
+export const defaultAuthGuard: AuthGuard = createAuthGuard(defaultAuthGuardDeps);
+
 export const {
   verifyAccessToken,
   verifyAuthorizationHeader,
   loadActiveProfile,
   resolveBoundDevice,
   requireAuth,
-} = createAuthGuard(defaultAuthGuardDeps);
+} = defaultAuthGuard;

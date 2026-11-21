@@ -2,7 +2,7 @@ import cors from 'cors';
 import express, { type NextFunction, type Request, type Response, type Router } from 'express';
 import helmet from 'helmet';
 import { env } from './config/env.js';
-import { createRequireAuth, requireAuth, type AuthGuardDeps } from './middleware/auth.js';
+import { createAuthGuard, defaultAuthGuard, type AuthGuardDeps } from './middleware/auth.js';
 import { requireHttps } from './middleware/https.js';
 import { createAuthRateLimiter } from './middleware/rate-limit.js';
 import {
@@ -14,7 +14,10 @@ import { AppError, type ErrorResponsePayload } from './types/errors.js';
 
 /** Test seams only; production calls `createApp()` without options. */
 export interface AppOptions {
-  /** Replaces the default Supabase-backed guard dependencies. */
+  /**
+   * Replaces the default Supabase-backed dependencies for BOTH the guard and the public router
+   * (one guard instance), so public handlers such as POST /api/v1/auth/session use them too.
+   */
   authGuardDeps?: AuthGuardDeps;
   /** Registers extra routes on the protected /api/v1 router (the production extension point). */
   registerProtectedRoutes?: (router: Router) => void;
@@ -63,13 +66,15 @@ export function createApp(options: AppOptions = {}) {
   // /api/v1 paths answer 401 to unauthenticated callers. New endpoints go into
   // routes/api-v1.ts (createProtectedApiRouter), never directly on `app`.
   // ---------------------------------------------------------------------------------------
-  app.use('/api/v1/auth', createAuthRateLimiter());
-  app.use(createPublicApiRouter());
+  // One guard instance shared by the public router and the protected mount.
+  const auth = options.authGuardDeps ? createAuthGuard(options.authGuardDeps) : defaultAuthGuard;
 
-  const guard = options.authGuardDeps ? createRequireAuth(options.authGuardDeps) : requireAuth;
+  app.use('/api/v1/auth', createAuthRateLimiter());
+  app.use(createPublicApiRouter(auth));
+
   const protectedApiRouter = createProtectedApiRouter();
   options.registerProtectedRoutes?.(protectedApiRouter);
-  app.use('/api/v1', guard, jsonBody, protectedApiRouter);
+  app.use('/api/v1', auth.requireAuth, jsonBody, protectedApiRouter);
 
   // 404 handler following the Unified HTTP Error Contract
   app.use((_req: Request, res: Response<ErrorResponsePayload>) => {

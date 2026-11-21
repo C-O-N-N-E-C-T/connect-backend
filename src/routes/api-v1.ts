@@ -1,4 +1,5 @@
 import express, { Router, type Request, type Response } from 'express';
+import type { AuthGuard } from '../middleware/auth.js';
 import type { ErrorResponsePayload } from '../types/errors.js';
 
 /**
@@ -18,7 +19,7 @@ export const jsonBody = express.json({ limit: '1mb' });
  * `/api/v1/auth/session-evil` do not match here and fall through to the guard (401).
  * The query string is ignored by routing.
  */
-export function createPublicApiRouter(): Router {
+export function createPublicApiRouter(auth: AuthGuard): Router {
   const router = Router({ caseSensitive: true, strict: true });
 
   // GET (and HEAD) only; other methods fall through to the guard.
@@ -31,10 +32,13 @@ export function createPublicApiRouter(): Router {
   });
 
   // OSP-60: replace this placeholder with the session binding handler (keep `jsonBody`).
-  // The guard does not run here, so the handler must verify the caller itself with
-  // `verifyAuthorizationHeader` + `loadActiveProfile` from middleware/auth.ts. Pass the
-  // `VerifiedClaims` returned by `verifyAuthorizationHeader` as is: never a body `user_id` or a
-  // self-decoded JWT (the branded type rejects those at compile time).
+  // The guard does not run here, so the handler must verify the caller itself with the `auth`
+  // passed in (same deps as the guard; fakes in tests via createApp({ authGuardDeps })):
+  //   const claims = await auth.verifyAuthorizationHeader(req.headers.authorization);
+  //   const profile = await auth.loadActiveProfile(claims);
+  // Do NOT import the module-level verifyAuthorizationHeader/loadActiveProfile here (they are
+  // bound to the real Supabase clients). Pass the `VerifiedClaims` as is: never a body
+  // `user_id` or a self-decoded JWT (the branded type rejects those at compile time).
   router.post(
     '/api/v1/auth/session',
     jsonBody,
