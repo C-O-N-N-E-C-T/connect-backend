@@ -1,7 +1,8 @@
 import express, { type Request, type Response } from 'express';
 import request from 'supertest';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { app, errorHandler } from '../src/app.js';
+import { createApp, errorHandler } from '../src/app.js';
+import { env } from '../src/config/env.js';
 import {
   AuthApiError,
   AuthInvalidJwtError,
@@ -403,17 +404,18 @@ describe('OSP-61: success', () => {
   });
 });
 
-// Real app: no Authorization header is sent, so the guard rejects before any network call.
-// Keep the number of /api/v1/auth/* requests in this file below the rate limit (10/min).
+// Real app (createApp). A fresh app per test gives a fresh auth rate-limit budget.
+// Without an Authorization header the default guard rejects before any network call.
 describe('OSP-61: guard mounting in the real app', () => {
-  it('GET /api/v1/health is public', async () => {
-    const res = await request(app).get('/api/v1/health');
-    expect(res.status).toBe(200);
+  it('GET and HEAD /api/v1/health are public', async () => {
+    expect((await request(createApp()).get('/api/v1/health')).status).toBe(200);
+    expect((await request(createApp()).head('/api/v1/health')).status).toBe(200);
   });
 
-  it('POST /api/v1/auth/session is not guarded (404 until OSP-60 adds the route)', async () => {
-    const res = await request(app).post('/api/v1/auth/session');
+  it('POST /api/v1/auth/session is not guarded (404 placeholder until OSP-60)', async () => {
+    const res = await request(createApp()).post('/api/v1/auth/session?x=1');
     expectError(res, 404, 'NOT_FOUND');
+    expect(res.headers['www-authenticate']).toBeUndefined();
   });
 
   it.each([
@@ -421,28 +423,189 @@ describe('OSP-61: guard mounting in the real app', () => {
     ['post', '/api/v1/auth/sessionX'],
     ['post', '/api/v1/auth/session/'],
     ['post', '/api/v1/auth/session/extra'],
+    ['post', '/API/V1/AUTH/SESSION'],
+    ['post', '/api/v1/auth/Session'],
+    ['post', '/api/v1/auth/%73ession'],
+    ['post', '/api/v1//auth/session'],
+    ['post', '/api/v1/auth//session'],
+    ['post', '/api/v1/auth/session%2F'],
+    ['post', '/api/v1/auth/session/../../admin'],
     ['get', '/api/v1/auth/session'],
     ['post', '/api/v1/auth/logout'],
     ['get', '/api/v1/whatever'],
     ['post', '/api/v1/health'],
+    ['get', '/api/v1/health/'],
+    ['get', '/API/V1/HEALTH'],
     ['get', '/api/v1'],
   ] as const)('%s %s is guarded (401)', async (method, path) => {
-    const res = await request(app)[method](path);
+    const res = await request(createApp())[method](path);
     expectError(res, 401, 'UNAUTHENTICATED');
+    expect(res.headers['www-authenticate']).toBe('Bearer');
     // The OSP-64 auth rate limiter runs before the guard on /api/v1/auth/*.
-    if (path.startsWith('/api/v1/auth/')) {
+    if (path.toLowerCase().startsWith('/api/v1/auth/')) {
       expect(res.headers['ratelimit-limit']).toBe('10');
     }
   });
 
   it('paths outside /api/v1 still return 404', async () => {
-    expectError(await request(app).get('/whatever'), 404, 'NOT_FOUND');
-    expectError(await request(app).get('/api/v2/whatever'), 404, 'NOT_FOUND');
-    expectError(await request(app).get('/api/v1x/whatever'), 404, 'NOT_FOUND');
+    const testApp = createApp();
+    expectError(await request(testApp).get('/whatever'), 404, 'NOT_FOUND');
+    expectError(await request(testApp).get('/api/v2/whatever'), 404, 'NOT_FOUND');
+    expectError(await request(testApp).get('/api/v1x/whatever'), 404, 'NOT_FOUND');
   });
 
   it('GET /health stays public', async () => {
-    expect((await request(app).get('/health')).status).toBe(200);
+    expect((await request(createApp()).get('/health')).status).toBe(200);
+  });
+
+  it('CORS preflight to a guarded path is answered before the guard', async () => {
+    const res = await request(createApp())
+      .options('/api/v1/whatever')
+      .set('Origin', env.CORS_ORIGIN)
+      .set('Access-Control-Request-Method', 'POST')
+      .set('Access-Control-Request-Headers', 'authorization,content-type');
+    expect(res.status).toBe(204);
+    expect(res.headers['access-control-allow-origin']).toBe(env.CORS_ORIGIN);
+  });
+
+  it('401 responses to the allowed origin carry CORS headers so browsers can read them', async () => {
+    const res = await request(createApp()).get('/api/v1/whatever').set('Origin', env.CORS_ORIGIN);
+    expect(res.status).toBe(401);
+    expect(res.headers['access-control-allow-origin']).toBe(env.CORS_ORIGIN);
+  });
+});
+
+describe('OSP-61 R4/R9: protected router extension point and real-app success path', () => {
+  function appWithFakes() {
+    return createApp({
+      authGuardDeps: {
+        authClient: { auth: { getClaims } } as unknown as AuthGuardDeps['authClient'],
+        dbClient: createFakeDbClient(db),
+      },
+      registerProtectedRoutes: (router) => {
+        router.get('/test/whoami', (req: Request, res: Response) => {
+          res.status(200).json({ auth: req.auth });
+        });
+        router.post('/test/echo', (req: Request, res: Response) => {
+          res.status(200).json({ body: req.body, auth: req.auth });
+        });
+      },
+    });
+  }
+
+  it('a route registered on the protected router is unreachable without a token', async () => {
+    const res = await request(appWithFakes()).get('/api/v1/test/whoami');
+    expectError(res, 401, 'UNAUTHENTICATED');
+    expect(getClaims).not.toHaveBeenCalled();
+  });
+
+  it('the default app guards the protected router too (no fakes)', async () => {
+    const res = await request(
+      createApp({
+        registerProtectedRoutes: (router) => {
+          router.get('/test/open', (_req: Request, res: Response) => {
+            res.status(200).json({ reached: true });
+          });
+        },
+      }),
+    ).get('/api/v1/test/open');
+    expectError(res, 401, 'UNAUTHENTICATED');
+  });
+
+  it('success through the real app attaches req.auth with the role from the DB', async () => {
+    const res = await request(appWithFakes())
+      .get('/api/v1/test/whoami')
+      .set('Authorization', `Bearer ${TOKEN}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      auth: { user_id: USER_ID, role: 'rescuer', device_id: DEVICE_ID, session_id: SESSION_ID },
+    });
+  });
+
+  it.each([
+    ['ACCOUNT_DISABLED', () => (db.tables.user_profiles = [profile({ is_active: false })])],
+    ['SESSION_NOT_BOUND', () => (db.tables.user_devices = [])],
+    ['DEVICE_REVOKED', () => (db.tables.user_devices = [device({ is_device_revoked: true })])],
+  ])('403 %s through the real app', async (code, arrange) => {
+    arrange();
+    const res = await request(appWithFakes())
+      .get('/api/v1/test/whoami')
+      .set('Authorization', `Bearer ${TOKEN}`);
+    expectError(res, 403, code);
+  });
+
+  it('authenticated request to an unknown /api/v1 path gets 404', async () => {
+    const res = await request(appWithFakes())
+      .get('/api/v1/does-not-exist')
+      .set('Authorization', `Bearer ${TOKEN}`);
+    expectError(res, 404, 'NOT_FOUND');
+  });
+
+  it('protected routes receive a parsed JSON body after authentication', async () => {
+    const res = await request(appWithFakes())
+      .post('/api/v1/test/echo')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .send({ hello: 'world' });
+    expect(res.status).toBe(200);
+    expect(res.body.body).toEqual({ hello: 'world' });
+    expect(res.body.auth.user_id).toBe(USER_ID);
+  });
+});
+
+describe('OSP-61 R3: body parsing runs after the guard; parser errors -> 400', () => {
+  const bigBody = JSON.stringify({ data: 'x'.repeat(1024 * 1024 + 10) });
+
+  function appWithFakes() {
+    return createApp({
+      authGuardDeps: {
+        authClient: { auth: { getClaims } } as unknown as AuthGuardDeps['authClient'],
+        dbClient: createFakeDbClient(db),
+      },
+      registerProtectedRoutes: (router) => {
+        router.post('/test/echo', (req: Request, res: Response) => {
+          res.status(200).json({ body: req.body });
+        });
+      },
+    });
+  }
+
+  it.each([
+    ['malformed JSON', '{bad'],
+    ['oversized JSON', bigBody],
+  ])('no token + %s on a guarded path -> 401, not 500', async (_name, body) => {
+    const res = await request(createApp())
+      .post('/api/v1/victims')
+      .set('Content-Type', 'application/json')
+      .send(body);
+    expectError(res, 401, 'UNAUTHENTICATED');
+  });
+
+  it.each([
+    ['malformed JSON', 'application/json', '{bad'],
+    ['oversized JSON', 'application/json', bigBody],
+    ['unsupported charset', 'application/json; charset=latin1', '{"a":1}'],
+  ])('authenticated + %s -> 400 VALIDATION_ERROR without parser details', async (_name, type, body) => {
+    const res = await request(appWithFakes())
+      .post('/api/v1/test/echo')
+      .set('Authorization', `Bearer ${TOKEN}`)
+      .set('Content-Type', type)
+      .send(body);
+    expectError(res, 400, 'VALIDATION_ERROR');
+    expect(res.body.message).not.toMatch(/JSON|position|entity|charset/i);
+  });
+
+  it('public POST /api/v1/auth/session still parses JSON (malformed -> 400, valid -> placeholder 404)', async () => {
+    const testApp = createApp();
+    const bad = await request(testApp)
+      .post('/api/v1/auth/session')
+      .set('Content-Type', 'application/json')
+      .send('{bad');
+    expectError(bad, 400, 'VALIDATION_ERROR');
+
+    const ok = await request(testApp)
+      .post('/api/v1/auth/session')
+      .send({ device_id: DEVICE_ID, device_name: 'phone' });
+    expectError(ok, 404, 'NOT_FOUND');
   });
 });
 

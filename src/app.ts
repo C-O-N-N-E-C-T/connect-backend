@@ -1,13 +1,26 @@
 import cors from 'cors';
-import express, { type NextFunction, type Request, type Response } from 'express';
+import express, { type NextFunction, type Request, type Response, type Router } from 'express';
 import helmet from 'helmet';
 import { env } from './config/env.js';
-import { requireAuth } from './middleware/auth.js';
+import { createRequireAuth, requireAuth, type AuthGuardDeps } from './middleware/auth.js';
 import { requireHttps } from './middleware/https.js';
-import { authRateLimiter } from './middleware/rate-limit.js';
+import { createAuthRateLimiter } from './middleware/rate-limit.js';
+import {
+  createProtectedApiRouter,
+  createPublicApiRouter,
+  jsonBody,
+} from './routes/api-v1.js';
 import { AppError, type ErrorResponsePayload } from './types/errors.js';
 
-export function createApp() {
+/** Test seams only; production calls `createApp()` without options. */
+export interface AppOptions {
+  /** Replaces the default Supabase-backed guard dependencies. */
+  authGuardDeps?: AuthGuardDeps;
+  /** Registers extra routes on the protected /api/v1 router (the production extension point). */
+  registerProtectedRoutes?: (router: Router) => void;
+}
+
+export function createApp(options: AppOptions = {}) {
   const app = express();
 
   // Trust the reverse proxy / edge (Render) so req.secure and req.ip are correct
@@ -23,7 +36,8 @@ export function createApp() {
   // Reject plain HTTP in production (NFR-SEC-02, AC-19)
   app.use(requireHttps);
 
-  // Strict CORS configured from environment variable
+  // Strict CORS configured from environment variable. Preflight (OPTIONS) requests end here
+  // with 204, before the auth guard.
   app.use(
     cors({
       // Array form: unlisted origins get no Access-Control-Allow-Origin header at all
@@ -32,10 +46,6 @@ export function createApp() {
     }),
   );
 
-  // JSON request body parser
-  app.use(express.json({ limit: '1mb' }));
-
-  // Health check endpoints
   app.get('/health', (_req: Request, res: Response) => {
     res.status(200).json({
       status: 'ok',
@@ -43,27 +53,23 @@ export function createApp() {
     });
   });
 
-  app.get('/api/v1/health', (_req: Request, res: Response) => {
-    res.status(200).json({
-      status: 'ok',
-      service: 'connect-backend',
-      version: 'v1',
-    });
-  });
+  // ---------------------------------------------------------------------------------------
+  // /api/v1 — order matters:
+  //   1. auth rate limiter (OSP-64) on /api/v1/auth/*, before the guard, so unauthenticated
+  //      brute force is still limited;
+  //   2. PUBLIC router (health, POST /api/v1/auth/session) — exact paths, no token;
+  //   3. auth guard (OSP-61), then JSON body parsing, then the PROTECTED router.
+  // Every /api/v1 request that is not an exact public route hits the guard, so unknown
+  // /api/v1 paths answer 401 to unauthenticated callers. New endpoints go into
+  // routes/api-v1.ts (createProtectedApiRouter), never directly on `app`.
+  // ---------------------------------------------------------------------------------------
+  app.use('/api/v1/auth', createAuthRateLimiter());
+  app.use(createPublicApiRouter());
 
-  // Rate limit all auth endpoints (OSP-64). Runs before the auth guard so that
-  // unauthenticated brute force against /api/v1/auth/* is still limited.
-  app.use('/api/v1/auth', authRateLimiter);
-
-  // Stateful auth guard on everything under /api/v1 except the public routes (OSP-61).
-  // Unknown /api/v1 paths therefore answer 401 to unauthenticated callers instead of 404.
-  app.use('/api/v1', (req: Request, res: Response, next: NextFunction) => {
-    if (isPublicApiRoute(req)) {
-      next();
-      return;
-    }
-    requireAuth(req, res, next);
-  });
+  const guard = options.authGuardDeps ? createRequireAuth(options.authGuardDeps) : requireAuth;
+  const protectedApiRouter = createProtectedApiRouter();
+  options.registerProtectedRoutes?.(protectedApiRouter);
+  app.use('/api/v1', guard, jsonBody, protectedApiRouter);
 
   // 404 handler following the Unified HTTP Error Contract
   app.use((_req: Request, res: Response<ErrorResponsePayload>) => {
@@ -79,23 +85,13 @@ export function createApp() {
 }
 
 /**
- * Routes under /api/v1 reachable without a token (OSP-61): the health check and the initial
- * session binding (POST /api/v1/auth/session, implemented by OSP-60).
- * Exact, case-sensitive match on method and full path (query string ignored). Express 5 routing
- * itself is case-insensitive and ignores one trailing slash, so variants like
- * `/api/v1/auth/session/` or `/API/V1/AUTH/SESSION` are NOT excluded and get the guard (fails
- * closed); prefix look-alikes such as `/api/v1/auth/session-evil` are guarded too.
+ * body-parser errors (invalid JSON, body too large, unsupported charset/encoding, aborted
+ * request, ...) are http-errors with a string `type` and a 4xx `status`.
  */
-const PUBLIC_API_ROUTES: ReadonlyArray<{ methods: readonly string[]; path: string }> = [
-  { methods: ['GET', 'HEAD'], path: '/api/v1/health' },
-  { methods: ['POST'], path: '/api/v1/auth/session' },
-];
-
-export function isPublicApiRoute(req: Request): boolean {
-  const fullPath = `${req.baseUrl}${req.path}`;
-  return PUBLIC_API_ROUTES.some(
-    (route) => route.path === fullPath && route.methods.includes(req.method),
-  );
+function isBodyParserError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const { type, status } = err as Error & { type?: unknown; status?: unknown };
+  return typeof type === 'string' && typeof status === 'number' && status >= 400 && status < 500;
 }
 
 /** Global error handler following the Unified HTTP Error Contract. */
@@ -109,6 +105,15 @@ export function errorHandler(
     res.status(err.statusCode).json({
       error_code: err.errorCode,
       message: err.message,
+    });
+    return;
+  }
+
+  // Client body errors: generic message, never the parser's own (it can echo body content).
+  if (isBodyParserError(err)) {
+    res.status(400).json({
+      error_code: 'VALIDATION_ERROR',
+      message: 'The request body is malformed, too large or uses an unsupported encoding.',
     });
     return;
   }
