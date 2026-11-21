@@ -48,8 +48,20 @@ const verifiedClaimsSchema = z.object({
   ]),
 });
 
-/** Claims of an access token that passed `getClaims` and the claim checks above. */
-export type VerifiedClaims = z.infer<typeof verifiedClaimsSchema>;
+/**
+ * Type-only brand: this symbol never exists at runtime and is not exported, so outside this
+ * module a `VerifiedClaims` value can only be obtained from `verifyAccessToken` /
+ * `verifyAuthorizationHeader`, never built from a self-decoded JWT or a request body.
+ */
+declare const verifiedClaimsBrand: unique symbol;
+
+/**
+ * Claims of an access token that passed `getClaims` and the claim checks above.
+ * Nominal (branded) and read-only, so the DB stages cannot be fed unverified or edited claims.
+ */
+export type VerifiedClaims = Readonly<z.infer<typeof verifiedClaimsSchema>> & {
+  readonly [verifiedClaimsBrand]: true;
+};
 
 type ProfileRow = Pick<UserProfile, 'role' | 'is_active' | 'all_sessions_revoked_at'>;
 type DeviceRow = Pick<UserDevice, 'user_id' | 'device_id' | 'is_device_revoked'>;
@@ -133,7 +145,8 @@ export function createAuthGuard(deps: AuthGuardDeps) {
     // Nothing from the token is trusted before getClaims succeeded.
     const parsed = verifiedClaimsSchema.safeParse(claims);
     if (!parsed.success) throw unauthenticatedError();
-    return parsed.data;
+    // The only place a VerifiedClaims value is created (type-level brand, no runtime change).
+    return parsed.data as VerifiedClaims;
   }
 
   /** `Authorization` header -> verified claims. Missing/malformed header -> 401. */
@@ -143,7 +156,10 @@ export function createAuthGuard(deps: AuthGuardDeps) {
     return verifyAccessToken(token);
   }
 
-  /** Missing profile / is_active false / iat <= all_sessions_revoked_at -> 403 ACCOUNT_DISABLED. */
+  /**
+   * Missing profile / is_active false / iat <= all_sessions_revoked_at -> 403 ACCOUNT_DISABLED.
+   * `claims` MUST come from verifyAccessToken / verifyAuthorizationHeader (enforced by the brand).
+   */
   async function loadActiveProfile(claims: VerifiedClaims): Promise<ProfileRow> {
     const { data: profile, error } = await deps.dbClient
       .from('user_profiles')
@@ -163,6 +179,7 @@ export function createAuthGuard(deps: AuthGuardDeps) {
 
   /**
    * Device row bound to the token's signed session_id claim (never a client header).
+   * `claims` MUST come from verifyAccessToken / verifyAuthorizationHeader (enforced by the brand).
    * Missing -> 403 SESSION_NOT_BOUND; revoked -> 403 DEVICE_REVOKED.
    * Filtering on user_id as well prevents a session bound to another user from matching.
    * More than one row for the same (session_id, user_id) makes maybeSingle error -> 500

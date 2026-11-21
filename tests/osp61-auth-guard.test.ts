@@ -15,6 +15,7 @@ import {
   createAuthGuard,
   createRequireAuth,
   extractBearerToken,
+  loadActiveProfile,
   verifyAccessToken,
   type AuthGuardDeps,
 } from '../src/middleware/auth.js';
@@ -811,6 +812,35 @@ describe('OSP-61 R10: reusable verification stages', () => {
     await expect(guard.loadActiveProfile(await guard.verifyAccessToken(TOKEN))).resolves.toMatchObject({
       role: 'rescuer',
     });
+  });
+
+  it('F2: the DB stages accept only claims produced by verifyAccessToken (type-level)', async () => {
+    const guard = createAuthGuard({
+      authClient: { auth: { getClaims } } as unknown as AuthGuardDeps['authClient'],
+      dbClient: createFakeDbClient(db),
+    });
+    const forged = {
+      sub: OTHER_USER_ID,
+      session_id: SESSION_ID,
+      iat: REVOKED_AT_SECONDS + 60,
+      aud: 'authenticated' as const,
+    };
+    // Never called: these lines exist for `npm run typecheck`, which fails if the brand is removed.
+    const typeChecksOnly = () => [
+      // @ts-expect-error a plain (self-decoded / body-supplied) object is not VerifiedClaims
+      guard.loadActiveProfile(forged),
+      // @ts-expect-error a plain (self-decoded / body-supplied) object is not VerifiedClaims
+      guard.resolveBoundDevice(forged),
+      // @ts-expect-error a plain object is not VerifiedClaims for the default-bound export either
+      loadActiveProfile(forged),
+    ];
+    expect(typeof typeChecksOnly).toBe('function');
+
+    const verified = await guard.verifyAccessToken(TOKEN);
+    // @ts-expect-error VerifiedClaims is read-only
+    const mutateOnly = () => (verified.sub = OTHER_USER_ID);
+    expect(typeof mutateOnly).toBe('function');
+    await expect(guard.resolveBoundDevice(verified)).resolves.toMatchObject({ device_id: DEVICE_ID });
   });
 
   it('the default verifyAccessToken rejects garbage locally (no network)', async () => {

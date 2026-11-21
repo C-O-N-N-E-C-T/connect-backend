@@ -32,7 +32,9 @@ export function createPublicApiRouter(): Router {
 
   // OSP-60: replace this placeholder with the session binding handler (keep `jsonBody`).
   // The guard does not run here, so the handler must verify the caller itself with
-  // `verifyAuthorizationHeader` + `loadActiveProfile` from middleware/auth.ts.
+  // `verifyAuthorizationHeader` + `loadActiveProfile` from middleware/auth.ts. Pass the
+  // `VerifiedClaims` returned by `verifyAuthorizationHeader` as is: never a body `user_id` or a
+  // self-decoded JWT (the branded type rejects those at compile time).
   router.post(
     '/api/v1/auth/session',
     jsonBody,
