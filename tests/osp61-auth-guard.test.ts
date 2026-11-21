@@ -419,6 +419,10 @@ describe('OSP-61: guard mounting in the real app', () => {
   ] as const)('%s %s is guarded (401)', async (method, path) => {
     const res = await request(app)[method](path);
     expectError(res, 401, 'UNAUTHENTICATED');
+    // The OSP-64 auth rate limiter runs before the guard on /api/v1/auth/*.
+    if (path.startsWith('/api/v1/auth/')) {
+      expect(res.headers['ratelimit-limit']).toBe('10');
+    }
   });
 
   it('paths outside /api/v1 still return 404', async () => {
