@@ -1,12 +1,29 @@
 import cors from 'cors';
-import express, { type NextFunction, type Request, type Response } from 'express';
+import express, { type NextFunction, type Request, type Response, type Router } from 'express';
 import helmet from 'helmet';
 import { env } from './config/env.js';
+import { createAuthGuard, defaultAuthGuard, type AuthGuardDeps } from './middleware/auth.js';
 import { requireHttps } from './middleware/https.js';
-import { authRateLimiter } from './middleware/rate-limit.js';
+import { createAuthRateLimiter } from './middleware/rate-limit.js';
+import {
+  createProtectedApiRouter,
+  createPublicApiRouter,
+  jsonBody,
+} from './routes/api-v1.js';
 import { AppError, type ErrorResponsePayload } from './types/errors.js';
 
-export function createApp() {
+/** Test seams only; production calls `createApp()` without options. */
+export interface AppOptions {
+  /**
+   * Replaces the default Supabase-backed dependencies for BOTH the guard and the public router
+   * (one guard instance), so public handlers such as POST /api/v1/auth/session use them too.
+   */
+  authGuardDeps?: AuthGuardDeps;
+  /** Registers extra routes on the protected /api/v1 router (the production extension point). */
+  registerProtectedRoutes?: (router: Router) => void;
+}
+
+export function createApp(options: AppOptions = {}) {
   const app = express();
 
   // Trust the reverse proxy / edge (Render) so req.secure and req.ip are correct
@@ -22,7 +39,8 @@ export function createApp() {
   // Reject plain HTTP in production (NFR-SEC-02, AC-19)
   app.use(requireHttps);
 
-  // Strict CORS configured from environment variable
+  // Strict CORS configured from environment variable. Preflight (OPTIONS) requests end here
+  // with 204, before the auth guard.
   app.use(
     cors({
       // Array form: unlisted origins get no Access-Control-Allow-Origin header at all
@@ -31,10 +49,6 @@ export function createApp() {
     }),
   );
 
-  // JSON request body parser
-  app.use(express.json({ limit: '1mb' }));
-
-  // Health check endpoints
   app.get('/health', (_req: Request, res: Response) => {
     res.status(200).json({
       status: 'ok',
@@ -42,16 +56,25 @@ export function createApp() {
     });
   });
 
-  app.get('/api/v1/health', (_req: Request, res: Response) => {
-    res.status(200).json({
-      status: 'ok',
-      service: 'connect-backend',
-      version: 'v1',
-    });
-  });
+  // ---------------------------------------------------------------------------------------
+  // /api/v1 — order matters:
+  //   1. auth rate limiter (OSP-64) on /api/v1/auth/*, before the guard, so unauthenticated
+  //      brute force is still limited;
+  //   2. PUBLIC router (health, POST /api/v1/auth/session) — exact paths, no token;
+  //   3. auth guard (OSP-61), then JSON body parsing, then the PROTECTED router.
+  // Every /api/v1 request that is not an exact public route hits the guard, so unknown
+  // /api/v1 paths answer 401 to unauthenticated callers. New endpoints go into
+  // routes/api-v1.ts (createProtectedApiRouter), never directly on `app`.
+  // ---------------------------------------------------------------------------------------
+  // One guard instance shared by the public router and the protected mount.
+  const auth = options.authGuardDeps ? createAuthGuard(options.authGuardDeps) : defaultAuthGuard;
 
-  // Rate limit all auth endpoints (OSP-64)
-  app.use('/api/v1/auth', authRateLimiter);
+  app.use('/api/v1/auth', createAuthRateLimiter());
+  app.use(createPublicApiRouter(auth));
+
+  const protectedApiRouter = createProtectedApiRouter();
+  options.registerProtectedRoutes?.(protectedApiRouter);
+  app.use('/api/v1', auth.requireAuth, jsonBody, protectedApiRouter);
 
   // 404 handler following the Unified HTTP Error Contract
   app.use((_req: Request, res: Response<ErrorResponsePayload>) => {
@@ -61,35 +84,36 @@ export function createApp() {
     });
   });
 
-  // Global error handler following the Unified HTTP Error Contract
-  app.use(
-    (
-      err: unknown,
-      _req: Request,
-      res: Response<ErrorResponsePayload>,
-      _next: NextFunction,
-    ) => {
-      if (err instanceof AppError) {
-        res.status(err.statusCode).json({
-          error_code: err.errorCode,
-          message: err.message,
-        });
-        return;
-      }
-
-      const message =
-        err instanceof Error && env.NODE_ENV !== 'production'
-          ? err.message
-          : 'An unexpected internal server error occurred.';
-
-      res.status(500).json({
-        error_code: 'INTERNAL_ERROR',
-        message,
-      });
-    },
-  );
+  app.use(errorHandler);
 
   return app;
+}
+
+/** Global error handler following the Unified HTTP Error Contract. */
+export function errorHandler(
+  err: unknown,
+  _req: Request,
+  res: Response<ErrorResponsePayload>,
+  _next: NextFunction,
+) {
+  if (err instanceof AppError) {
+    res.status(err.statusCode).json({
+      error_code: err.errorCode,
+      message: err.message,
+    });
+    return;
+  }
+
+  // Body parser errors arrive here already mapped to AppError 400 by `jsonBody`.
+  const message =
+    err instanceof Error && env.NODE_ENV !== 'production'
+      ? err.message
+      : 'An unexpected internal server error occurred.';
+
+  res.status(500).json({
+    error_code: 'INTERNAL_ERROR',
+    message,
+  });
 }
 
 export const app = createApp();
