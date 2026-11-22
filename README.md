@@ -51,6 +51,15 @@ Node.js + Express + TypeScript backend API and Supabase CLI migrations for the *
 - **CORS:** Only `CORS_ORIGIN` receives an `Access-Control-Allow-Origin` header.
 - **Rate limiting:** `/api/v1/auth/*` allows 10 requests per minute per client IP. Exceeding it returns `429 RATE_LIMITED`. The counter is in memory, so it applies per running instance.
 
+## Auth Endpoints (OSP-60)
+
+| Endpoint | Guarded | Purpose |
+| --- | --- | --- |
+| `POST /api/v1/auth/session` | No (verifies the token itself) | Called right after Supabase sign-in with `{device_id, device_name}`. Binds the token's `session_id` to the device, writes a `LOGIN` audit row and returns `{user_id, role, device_id}`, plus a 72 h unsigned `offline_mission_grant` for rescuers. |
+| `POST /api/v1/auth/logout` | Yes | Clears this session's device binding and writes a `LOGOUT` audit row. `204`, no body. Call it before Supabase `signOut()`. |
+
+Until `/auth/session` succeeds, every guarded request with that token gets `403 SESSION_NOT_BOUND`. Full contract and error codes: [docs/osp-60-auth-session.md](docs/osp-60-auth-session.md).
+
 ## Deployment (Render)
 
 1. **Create a Web Service** in Render from this repository (Node runtime, `26.x` or `24.x` to match `.nvmrc`).
