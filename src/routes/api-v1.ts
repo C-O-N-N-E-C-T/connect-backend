@@ -6,7 +6,9 @@ import express, {
   type Response,
 } from 'express';
 import type { AuthGuard } from '../middleware/auth.js';
-import { AppError, type ErrorResponsePayload } from '../types/errors.js';
+import type { SessionStore } from '../services/session-store.js';
+import { AppError } from '../types/errors.js';
+import { createLogoutHandler, createSessionHandler } from './auth.js';
 
 const parseJson = express.json({ limit: '1mb' });
 
@@ -56,7 +58,7 @@ export const jsonBody: RequestHandler = (req: Request, res: Response, next: Next
  * `/api/v1/auth/session-evil` do not match here and fall through to the guard (401).
  * The query string is ignored by routing.
  */
-export function createPublicApiRouter(auth: AuthGuard): Router {
+export function createPublicApiRouter(auth: AuthGuard, sessionStore: SessionStore): Router {
   const router = Router({ caseSensitive: true, strict: true });
 
   // GET (and HEAD) only; other methods fall through to the guard.
@@ -68,35 +70,26 @@ export function createPublicApiRouter(auth: AuthGuard): Router {
     });
   });
 
-  // OSP-60: replace this placeholder with the session binding handler (keep `jsonBody`).
-  // The guard does not run here, so the handler must verify the caller itself with the `auth`
-  // passed in (same deps as the guard; fakes in tests via createApp({ authGuardDeps })):
-  //   const claims = await auth.verifyAuthorizationHeader(req.headers.authorization);
-  //   const profile = await auth.loadActiveProfile(claims);
-  // Do NOT import the module-level verifyAuthorizationHeader/loadActiveProfile here (they are
-  // bound to the real Supabase clients). Pass the `VerifiedClaims` as is: never a body
-  // `user_id` or a self-decoded JWT (the branded type rejects those at compile time).
-  router.post(
-    '/api/v1/auth/session',
-    jsonBody,
-    (_req: Request, res: Response<ErrorResponsePayload>) => {
-      res.status(404).json({
-        error_code: 'NOT_FOUND',
-        message: 'The requested endpoint does not exist.',
-      });
-    },
-  );
+  // OSP-60: session binding. The guard does not run here, so the handler verifies the caller
+  // itself through the `auth` passed in (same guard instance and deps as the protected mount;
+  // fakes in tests via createApp({ authGuardDeps, sessionStore })). `jsonBody` stays: the
+  // public router gets no body parser otherwise. See src/routes/auth.ts.
+  router.post('/api/v1/auth/session', jsonBody, createSessionHandler(auth, sessionStore));
 
   return router;
 }
 
 /**
- * PROTECTED /api/v1 routes: ALL /api/v1 endpoints except the public ones above go here
- * (e.g. OSP-60 `router.post('/auth/logout', ...)`). Paths are relative to /api/v1.
- * app.ts mounts this router behind `requireAuth` and `jsonBody`, so every handler can rely on
- * `req.auth` and a parsed JSON body. Never mount routes for /api/v1 anywhere else.
+ * PROTECTED /api/v1 routes: ALL /api/v1 endpoints except the public ones above go here.
+ * Paths are relative to /api/v1. app.ts mounts this router behind `requireAuth` and
+ * `jsonBody`, so every handler can rely on `req.auth` and a parsed JSON body.
+ * Never mount routes for /api/v1 anywhere else.
  */
-export function createProtectedApiRouter(): Router {
+export function createProtectedApiRouter(sessionStore: SessionStore): Router {
   const router = Router();
+
+  // OSP-60: clears this session's device binding and writes LOGOUT. 204, no body.
+  router.post('/auth/logout', createLogoutHandler(sessionStore));
+
   return router;
 }

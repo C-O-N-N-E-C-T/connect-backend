@@ -70,10 +70,12 @@ describe('OSP-64: HTTPS/TLS, CORS and auth rate limiting', () => {
   // Keep this test the only one in this file that hits /api/v1/auth,
   // because the limiter store is shared across requests in the same module.
   it('returns 429 RATE_LIMITED after 10 auth requests per minute', async () => {
-    for (let i = 0; i < 10; i++) {
+       for (let i = 0; i < 10; i++) {
+      // OSP-60: no token -> 401 from the session handler; still counted by the limiter.
       const res = await request(app).post('/api/v1/auth/session');
-      expect(res.status).toBe(404);
+      expect(res.status).toBe(401);
     }
+
 
     const limited = await request(app).post('/api/v1/auth/session');
     expect(limited.status).toBe(429);

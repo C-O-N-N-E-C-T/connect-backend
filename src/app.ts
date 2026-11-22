@@ -10,6 +10,7 @@ import {
   createPublicApiRouter,
   jsonBody,
 } from './routes/api-v1.js';
+import { defaultSessionStore, type SessionStore } from './services/session-store.js';
 import { AppError, type ErrorResponsePayload } from './types/errors.js';
 
 /** Test seams only; production calls `createApp()` without options. */
@@ -19,6 +20,11 @@ export interface AppOptions {
    * (one guard instance), so public handlers such as POST /api/v1/auth/session use them too.
    */
   authGuardDeps?: AuthGuardDeps;
+  /**
+   * OSP-60: replaces the Supabase RPC store used by POST /api/v1/auth/session and
+   * POST /api/v1/auth/logout for all database writes (binding, unbinding, audit rows).
+   */
+  sessionStore?: SessionStore;
   /** Registers extra routes on the protected /api/v1 router (the production extension point). */
   registerProtectedRoutes?: (router: Router) => void;
 }
@@ -68,11 +74,13 @@ export function createApp(options: AppOptions = {}) {
   // ---------------------------------------------------------------------------------------
   // One guard instance shared by the public router and the protected mount.
   const auth = options.authGuardDeps ? createAuthGuard(options.authGuardDeps) : defaultAuthGuard;
+  // OSP-60: one session store shared by /auth/session (public) and /auth/logout (protected).
+  const sessionStore = options.sessionStore ?? defaultSessionStore;
 
   app.use('/api/v1/auth', createAuthRateLimiter());
-  app.use(createPublicApiRouter(auth));
+  app.use(createPublicApiRouter(auth, sessionStore));
 
-  const protectedApiRouter = createProtectedApiRouter();
+  const protectedApiRouter = createProtectedApiRouter(sessionStore);
   options.registerProtectedRoutes?.(protectedApiRouter);
   app.use('/api/v1', auth.requireAuth, jsonBody, protectedApiRouter);
 
