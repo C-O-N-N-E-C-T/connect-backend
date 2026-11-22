@@ -7,6 +7,8 @@ import express, {
 } from 'express';
 import type { AuthGuard } from '../middleware/auth.js';
 import { AppError, type ErrorResponsePayload } from '../types/errors.js';
+import { defaultVictimStore, type VictimStore } from '../services/victim-store.js';
+import { registerBusinessRoutes } from './business.js';
 
 const parseJson = express.json({ limit: '1mb' });
 
@@ -96,7 +98,14 @@ export function createPublicApiRouter(auth: AuthGuard): Router {
  * app.ts mounts this router behind `requireAuth` and `jsonBody`, so every handler can rely on
  * `req.auth` and a parsed JSON body. Never mount routes for /api/v1 anywhere else.
  */
-export function createProtectedApiRouter(): Router {
+export function createProtectedApiRouter(options: ProtectedApiRouterOptions = {}): Router {
   const router = Router();
+  // OSP-62: rol korumalı stub iş uçları; store verilmezse gerçek (Supabase) store kullanılır.
+  registerBusinessRoutes(router, options.victimStore ?? defaultVictimStore);
   return router;
+}
+
+/** OSP-62: korumalı router bağımlılıkları (test enjeksiyonu için opsiyonel obje). */
+export interface ProtectedApiRouterOptions {
+  victimStore?: VictimStore;
 }
