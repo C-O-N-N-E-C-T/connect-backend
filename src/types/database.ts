@@ -5,6 +5,9 @@ export type AppRole = (typeof APP_ROLES)[number];
 export const AUDIT_ACTION_TYPES = [
   'LOGIN',
   'LOGOUT',
+  // OSP-60: verified user whose /auth/session was refused (metadata.reason:
+  // 'ACCOUNT_DISABLED' | 'DEVICE_REVOKED'). 401 / 400 attempts are never audited.
+  'LOGIN_REJECTED',
   'USER_CREATED',
   'DEVICE_REVOKED',
   'ACCOUNT_DISABLED',
@@ -14,6 +17,7 @@ export const AUDIT_ACTION_TYPES = [
   'VICTIM_UPDATE',
   'RETENTION_PURGE',
 ] as const;
+
 
 export type AuditActionType = (typeof AUDIT_ACTION_TYPES)[number];
 

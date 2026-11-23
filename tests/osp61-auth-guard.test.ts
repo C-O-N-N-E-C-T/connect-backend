@@ -414,10 +414,13 @@ describe('OSP-61: guard mounting in the real app', () => {
     expect((await request(createApp()).head('/api/v1/health')).status).toBe(200);
   });
 
-  it('POST /api/v1/auth/session is not guarded (404 placeholder until OSP-60)', async () => {
+   // OSP-60: the route now exists and verifies the token itself, so without a token it answers
+  // 401 like the guard would. That it is NOT guarded (reachable before a session is bound) is
+  // proven in tests/osp60-auth-session.test.ts ("OSP-60 x OSP-61").
+  it('POST /api/v1/auth/session is handled by the OSP-60 handler (no token -> 401)', async () => {
     const res = await request(createApp()).post('/api/v1/auth/session?x=1');
-    expectError(res, 404, 'NOT_FOUND');
-    expect(res.headers['www-authenticate']).toBeUndefined();
+    expectError(res, 401, 'UNAUTHENTICATED');
+    expect(res.headers['www-authenticate']).toBe('Bearer');
   });
 
   it.each([
@@ -596,7 +599,7 @@ describe('OSP-61 R3: body parsing runs after the guard; parser errors -> 400', (
     expect(res.body.message).not.toMatch(/JSON|position|entity|charset/i);
   });
 
-  it('public POST /api/v1/auth/session still parses JSON (malformed -> 400, valid -> placeholder 404)', async () => {
+  it('public POST /api/v1/auth/session still parses JSON (malformed -> 400, valid without token -> 401)', async () => {
     const testApp = createApp();
     const bad = await request(testApp)
       .post('/api/v1/auth/session')
@@ -607,7 +610,8 @@ describe('OSP-61 R3: body parsing runs after the guard; parser errors -> 400', (
     const ok = await request(testApp)
       .post('/api/v1/auth/session')
       .send({ device_id: DEVICE_ID, device_name: 'phone' });
-    expectError(ok, 404, 'NOT_FOUND');
+    // OSP-60: a well-formed body reaches the handler, which rejects the missing token.
+    expectError(ok, 401, 'UNAUTHENTICATED');
   });
 });
 

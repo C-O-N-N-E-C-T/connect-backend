@@ -75,11 +75,11 @@ describe('OSP-61 F1: createApp feeds the same guard deps to the public router', 
     expect(res.body.error_code).toBe('SESSION_NOT_BOUND');
   });
 
-  it('public routes keep working (health 200, session placeholder 404, no token needed)', async () => {
+  it('public routes keep working (health 200, session without token 401 from the OSP-60 handler)', async () => {
     const { deps, getClaims } = fakeDeps();
     const testApp = createApp({ authGuardDeps: deps });
     expect((await request(testApp).get('/api/v1/health')).status).toBe(200);
-    expect((await request(testApp).post('/api/v1/auth/session')).status).toBe(404);
+    expect((await request(testApp).post('/api/v1/auth/session')).status).toBe(401);
     expect(getClaims).not.toHaveBeenCalled();
   });
 });
