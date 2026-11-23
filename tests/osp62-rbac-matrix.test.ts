@@ -12,6 +12,7 @@ import {
   type VictimStore,
 } from '../src/services/victim-store.js';
 import type { AppRole, VictimRecord } from '../src/types/database.js';
+import type { AuthContext } from '../src/types/express.js';
 
 // ---------------------------------------------------------------------------
 // KESİN KURAL: bu dosyadaki hiçbir test gerçek (paylaşılan) Supabase projesine gitmez.
@@ -123,7 +124,7 @@ function createFakeStore() {
       async (
         id: string,
         payload: Record<string, unknown>,
-        actorUserId: string,
+        actor: AuthContext,
         options: OverrideOptions = {},
       ) => {
         const victim = victims.find((v) => v.id === id);
@@ -131,15 +132,15 @@ function createFakeStore() {
         victim.payload = {
           ...victim.payload,
           ...payload,
-          _override: { by: actorUserId, ...(options.reason ? { reason: options.reason } : {}) },
+          _override: { by: actor.user_id, ...(options.reason ? { reason: options.reason } : {}) },
         };
         return { ...victim };
       },
     ),
-    insertObservation: vi.fn(async (payload: Record<string, unknown>, actorUserId: string) => ({
+    insertObservation: vi.fn(async (payload: Record<string, unknown>, actor: AuthContext) => ({
       id: '77777777-7777-4777-8777-777777777777',
       created_at: '2026-11-22T10:00:00+00:00',
-      created_by: actorUserId,
+      created_by: actor.user_id,
       payload,
     })),
   } satisfies VictimStore;
@@ -188,7 +189,7 @@ beforeEach(() => {
   app = createApp({
     authGuardDeps: fakeGuardDeps(),
     victimStore: store,
-        // OSP-65: kazazede verisi uçları artık audit satırı yazıyor; bellekte tut (gerçek DB yok).
+    // OSP-65: kazazede verisi uçları artık audit satırı yazıyor; bellekte tut (gerçek DB yok).
     auditLogStore: { write: async () => undefined },
     registerProtectedRoutes: registerTestAdminRoute,
   });
@@ -378,7 +379,10 @@ describe('OSP-62: yanıt içerikleri ve kimlik bağlama', () => {
   it('POST /sync created_by = req.auth.user_id (gövdeden değil)', async () => {
     const res = await send(ENDPOINTS[0]!, 'rescuer');
     expect(res.status).toBe(201);
-    expect(store.insertObservation).toHaveBeenCalledWith({ note: 'voice heard' }, USERS.rescuer.id);
+    expect(store.insertObservation).toHaveBeenCalledWith(
+      { note: 'voice heard' },
+      expect.objectContaining({ user_id: USERS.rescuer.id, role: 'rescuer' }),
+    );
     expect(res.body.observation.created_by).toBe(USERS.rescuer.id);
   });
 
@@ -388,7 +392,7 @@ describe('OSP-62: yanıt içerikleri ve kimlik bağlama', () => {
     expect(store.overrideVictim).toHaveBeenCalledWith(
       VICTIM_ID,
       { status: 'rescued' },
-      USERS.coordinator.id,
+      expect.objectContaining({ user_id: USERS.coordinator.id, role: 'coordinator' }),
       { reason: 'field confirmation' },
     );
     expect(res.body.victim.payload.status).toBe('rescued');
@@ -507,43 +511,87 @@ describe('OSP-62: createSupabaseVictimStore (sahte client, ağ yok)', () => {
       calls.push(['from', table]);
       return builder;
     });
-    return { client: { from } as unknown as Parameters<typeof createSupabaseVictimStore>[0], calls };
+    const rpc = vi.fn(async (fn: string, args: unknown) => {
+      calls.push(['rpc', fn, args]);
+      return result;
+    });
+    return { client: { from, rpc } as unknown as Parameters<typeof createSupabaseVictimStore>[0], calls };
   }
 
-  it('insertObservation created_by = actor ile rescuer_observations\'a yazar', async () => {
+  const RESCUER: AuthContext = {
+    user_id: USERS.rescuer.id,
+    role: 'rescuer',
+    device_id: USERS.rescuer.device,
+    session_id: USERS.rescuer.session,
+  };
+  const COORDINATOR: AuthContext = {
+    user_id: USERS.coordinator.id,
+    role: 'coordinator',
+    device_id: USERS.coordinator.device,
+    session_id: USERS.coordinator.session,
+  };
+
+  it('insertObservation gözlemi + audit satırını tek RPC ile yazar (created_by = actor)', async () => {
     const row = { id: 'x', created_at: 't', created_by: USERS.rescuer.id, payload: { a: 1 } };
     const { client, calls } = fakeClient({ data: row, error: null });
-    await expect(
-      createSupabaseVictimStore(client).insertObservation({ a: 1 }, USERS.rescuer.id),
-    ).resolves.toEqual(row);
-    expect(calls).toContainEqual(['from', 'rescuer_observations']);
-    expect(calls).toContainEqual(['insert', { payload: { a: 1 }, created_by: USERS.rescuer.id }]);
+    await expect(createSupabaseVictimStore(client).insertObservation({ a: 1 }, RESCUER)).resolves.toEqual(row);
+    expect(calls).toEqual([
+      [
+        'rpc',
+        'sync_observation_audited',
+        {
+          p_actor_user_id: USERS.rescuer.id,
+          p_actor_role: 'rescuer',
+          p_device_id: USERS.rescuer.device,
+          p_payload: { a: 1 },
+        },
+      ],
+    ]);
   });
 
-  it('overrideVictim reason verilirse _override.reason olarak yazar, verilmezse alanı eklemez', async () => {
-    const existing = { id: VICTIM_ID, created_at: 't', created_by: null, payload: { a: 1 } };
-    const withReason = fakeClient({ data: existing, error: null });
-    await createSupabaseVictimStore(withReason.client).overrideVictim(
-      VICTIM_ID,
-      { b: 2 },
-      USERS.coordinator.id,
-      { reason: 'confirmed' },
-    );
-    const update = withReason.calls.find((c) => c[0] === 'update')?.[1] as {
-      payload: { a: number; b: number; _override: Record<string, unknown> };
-    };
-    expect(update.payload).toMatchObject({
-      a: 1,
-      b: 2,
-      _override: { by: USERS.coordinator.id, reason: 'confirmed', at: expect.any(String) },
-    });
+  it('overrideVictim tek RPC çağırır; reason verilmezse p_reason = null', async () => {
+    const updated = { id: VICTIM_ID, created_at: 't', created_by: null, payload: { a: 1, b: 2 } };
+    const withReason = fakeClient({ data: updated, error: null });
+    await expect(
+      createSupabaseVictimStore(withReason.client).overrideVictim(VICTIM_ID, { b: 2 }, COORDINATOR, {
+        reason: 'confirmed',
+      }),
+    ).resolves.toEqual(updated);
+    expect(withReason.calls).toEqual([
+      [
+        'rpc',
+        'override_victim_audited',
+        {
+          p_victim_id: VICTIM_ID,
+          p_actor_user_id: USERS.coordinator.id,
+          p_actor_role: 'coordinator',
+          p_device_id: USERS.coordinator.device,
+          p_payload: { b: 2 },
+          p_reason: 'confirmed',
+        },
+      ],
+    ]);
 
-    const noReason = fakeClient({ data: existing, error: null });
-    await createSupabaseVictimStore(noReason.client).overrideVictim(VICTIM_ID, { b: 2 }, USERS.coordinator.id);
-    const update2 = noReason.calls.find((c) => c[0] === 'update')?.[1] as {
-      payload: { _override: Record<string, unknown> };
-    };
-    expect(update2.payload._override).not.toHaveProperty('reason');
+    const noReason = fakeClient({ data: updated, error: null });
+    await createSupabaseVictimStore(noReason.client).overrideVictim(VICTIM_ID, { b: 2 }, COORDINATOR);
+    expect((noReason.calls[0]?.[2] as { p_reason: unknown }).p_reason).toBeNull();
+  });
+
+  it('overrideVictim kayıt yoksa (RPC NULL) null döner', async () => {
+    const { client } = fakeClient({ data: null, error: null });
+    await expect(createSupabaseVictimStore(client).overrideVictim(VICTIM_ID, { b: 2 }, COORDINATOR)).resolves.toBeNull();
+  });
+
+  it.each([
+    ['insertObservation', (s: VictimStore) => s.insertObservation({ a: 1 }, RESCUER)],
+    ['overrideVictim', (s: VictimStore) => s.overrideVictim(VICTIM_ID, { b: 2 }, COORDINATOR)],
+  ] as const)('%s: RPC hatası (ör. audit insert başarısız) ayrıntı sızdırmadan 500 olur', async (_n, call) => {
+    const { client } = fakeClient({ data: null, error: { message: 'audit_logs secret detail' } });
+    await expect(call(createSupabaseVictimStore(client))).rejects.toMatchObject({
+      statusCode: 500,
+      errorCode: 'INTERNAL_ERROR',
+      message: expect.not.stringContaining('secret'),
+    });
   });
 
   it('getVictim id ile filtreler; yoksa null', async () => {

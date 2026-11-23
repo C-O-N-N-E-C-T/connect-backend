@@ -6,21 +6,25 @@ import { defaultAuditLogStore, type AuditEntry, type AuditLogStore } from './aud
 /**
  * OSP-65: OSP-62'nin kazazede verisi uçları (src/routes/business.ts) için audit yardımcısı.
  *
- * İşlem başarılı olduktan SONRA ve cevap gönderilmeden ÖNCE çağrılır:
+ * OKUMA uçlarında işlem başarılı olduktan SONRA ve cevap gönderilmeden ÖNCE çağrılır:
  *
  *   const victim = await store.getVictim(id);       // bulunamazsa -> 404, audit satırı yok
  *   if (!victim) throw victimNotFoundError();
  *   await audit.view(req, victim.id);               // satır yazılamazsa 500 fırlatır
  *   res.status(200).json({ victim });
  *
- * | Uç                            | Çağrı                         | Satır                          |
- * |-------------------------------|-------------------------------|--------------------------------|
- * | GET   /victims                | list(req, { result_count })   | TEK VICTIM_LIST_VIEW (özet)    |
- * | GET   /victims/:id            | view(req, id)                 | VICTIM_VIEW + hedef id         |
- * | PATCH /victims/:id/override   | override(req, id, { reason }) | VICTIM_UPDATE + hedef id       |
- * | POST  /sync                   | sync(req, observationId)      | OBSERVATION_SYNC + hedef id    |
+ * YAZMA uçlarında audit satırını store, değişiklikle aynı DB transaction'ında yazar
+ * (src/services/victim-store.ts). Audit yazılamazsa değişiklik de geri alınır. Route yalnızca
+ * store başarıyla döndükten sonra `audit.recordedByStore(req)` ile isteği işaretler.
  *
- * Başarılı bir yazım isteği "audit edildi" olarak işaretler; `requireVictimAudit`
+ * | Uç                            | Audit'i yazan                    | Satır                          |
+ * |-------------------------------|----------------------------------|--------------------------------|
+ * | GET   /victims                | list(req, { result_count })      | TEK VICTIM_LIST_VIEW (özet)    |
+ * | GET   /victims/:id            | view(req, id)                    | VICTIM_VIEW + hedef id         |
+ * | PATCH /victims/:id/override   | store.overrideVictim (tek tx)    | VICTIM_UPDATE + `has_reason`   |
+ * | POST  /sync                   | store.insertObservation (tek tx) | OBSERVATION_SYNC + hedef id    |
+ *
+ * Başarılı her istek "audit edildi" olarak işaretlenir; `requireVictimAudit`
  * (src/middleware/victim-audit-enforcer.ts) bu path'lerde işaretsiz her 2xx cevabı engeller.
  */
 export interface VictimListSummary {
@@ -32,8 +36,11 @@ export interface VictimListSummary {
 export interface VictimAudit {
   list(req: Request, summary: VictimListSummary): Promise<void>;
   view(req: Request, victimId: string): Promise<void>;
-  override(req: Request, victimId: string, details?: { reason?: string | undefined }): Promise<void>;
-  sync(req: Request, observationId: string): Promise<void>;
+  /**
+   * Store audit satırını yazımla aynı transaction'da yazdı (overrideVictim / insertObservation);
+   * isteği "audit edildi" olarak işaretler. Yalnızca store başarıyla döndükten sonra çağrılır.
+   */
+  recordedByStore(req: Request): void;
 }
 
 /** Audit satırı yazılmış istekler. WeakSet: kayıtlar istekle birlikte bellekten silinir. */
@@ -68,17 +75,10 @@ export function createVictimAudit(store: AuditLogStore): VictimAudit {
       }),
     view: (req, victimId) =>
       record(req, { action_type: 'VICTIM_VIEW', target_record_id: victimId }),
-    override: (req, victimId, details = {}) =>
-      record(req, {
-        action_type: 'VICTIM_UPDATE',
-        target_record_id: victimId,
-        metadata: {
-          override: true,
-          ...(details.reason !== undefined ? { reason: details.reason } : {}),
-        },
-      }),
-    sync: (req, observationId) =>
-      record(req, { action_type: 'OBSERVATION_SYNC', target_record_id: observationId }),
+    recordedByStore: (req) => {
+      actorOf(req);
+      auditedRequests.add(req);
+    },
   };
 }
 

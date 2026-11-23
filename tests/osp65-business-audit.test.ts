@@ -2,7 +2,6 @@ import request from 'supertest';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
 import { supabaseAdmin } from '../src/config/supabase.js';
-import type { VictimStore } from '../src/services/victim-store.js';
 import {
   ACTOR,
   AUTH_HEADER,
@@ -16,6 +15,7 @@ import {
   fakeVictimStore,
   victim,
   type FakeAuditStore,
+  type FakeVictimStore,
 } from './helpers/osp65-fakes.js';
 
 // AC-28, GERÇEK OSP-62 uçları (src/routes/business.ts) üzerinde, gerçek uygulama ile:
@@ -32,15 +32,18 @@ afterAll(() => {
 });
 
 let audit: FakeAuditStore;
-let store: VictimStore;
+let store: FakeVictimStore;
 
 beforeEach(() => {
   audit = fakeAuditStore();
-  store = fakeVictimStore([
-    victim(),
-    victim({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }),
-    victim({ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }),
-  ]);
+  store = fakeVictimStore(
+    [
+      victim(),
+      victim({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }),
+      victim({ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }),
+    ],
+    audit,
+  );
 });
 
 const app = () =>
@@ -68,7 +71,7 @@ describe('OSP-65: one audit row per successful victim-data request (AC-28)', () 
     expect(audit.rows).toEqual([{ actor: ACTOR, action_type: 'VICTIM_VIEW', target_record_id: RECORD_ID }]);
   });
 
-  it('PATCH /victims/:id/override -> 200 and one VICTIM_UPDATE row (override + reason)', async () => {
+  it('PATCH /victims/:id/override -> 200 and one VICTIM_UPDATE row (has_reason, not the text)', async () => {
     const res = await request(app())
       .patch(`/api/v1/victims/${RECORD_ID}/override`)
       .set(AUTH_HEADER)
@@ -79,18 +82,21 @@ describe('OSP-65: one audit row per successful victim-data request (AC-28)', () 
         actor: ACTOR,
         action_type: 'VICTIM_UPDATE',
         target_record_id: RECORD_ID,
-        metadata: { override: true, reason: 'visual check' },
+        metadata: { override: true, has_reason: true },
       },
     ]);
+    // Gerekçe metni değiştirilemez audit tablosuna girmez; yalnızca kayıtta kalır.
+    expect(JSON.stringify(audit.rows)).not.toContain('visual check');
+    expect(store.records[0]?.payload._override).toMatchObject({ reason: 'visual check' });
   });
 
-  it('PATCH /victims/:id/override without a reason -> metadata has no reason key', async () => {
+  it('PATCH /victims/:id/override without a reason -> has_reason: false', async () => {
     await request(app())
       .patch(`/api/v1/victims/${RECORD_ID}/override`)
       .set(AUTH_HEADER)
       .send({ payload: { triage: 'yellow' } })
       .expect(200);
-    expect(audit.rows[0]?.metadata).toEqual({ override: true });
+    expect(audit.rows[0]?.metadata).toEqual({ override: true, has_reason: false });
   });
 
   it('POST /sync (rescuer) -> 201 and one OBSERVATION_SYNC row with the observation id', async () => {
@@ -137,6 +143,32 @@ describe('OSP-65: safety', () => {
     expect(res.text).not.toContain(OBSERVATION_ID);
   });
 
+  it('atomic: audit write fails on POST /sync -> 500 and the observation is NOT stored (no duplicate on retry)', async () => {
+    audit.fail = true;
+    const call = () =>
+      request(app()).post('/api/v1/sync').set(RESCUER_AUTH_HEADER).send({ payload: { n: 1 } });
+    expect((await call()).status).toBe(500);
+    expect((await call()).status).toBe(500);
+    expect(store.observations).toHaveLength(0);
+
+    audit.fail = false;
+    expect((await call()).status).toBe(201);
+    expect(store.observations).toHaveLength(1);
+    expect(audit.rows).toHaveLength(1);
+  });
+
+  it('atomic: audit write fails on PATCH override -> 500 and the victim record is unchanged', async () => {
+    audit.fail = true;
+    const before = structuredClone(store.records[0]);
+    const res = await request(app())
+      .patch(`/api/v1/victims/${RECORD_ID}/override`)
+      .set(AUTH_HEADER)
+      .send({ payload: { triage: 'black' }, reason: 'x' });
+    expect(res.status).toBe(500);
+    expect(res.text).not.toContain('trapped');
+    expect(store.records[0]).toEqual(before);
+  });
+
   it('the actor comes from the verified token, not from spoofed headers or body', async () => {
     await request(app())
       .patch(`/api/v1/victims/${RECORD_ID}/override`)
@@ -147,6 +179,7 @@ describe('OSP-65: safety', () => {
     expect(audit.rows[0]?.actor).toEqual(ACTOR);
   });
 
+  // TODO(atama tablosu): atama kalıcı kaydedildiğinde bu test "bir audit satırı yazılır" olmalı.
   it('POST /assignments (stub, persists nothing) is not audited and still answers 201', async () => {
     const res = await request(app())
       .post('/api/v1/assignments')

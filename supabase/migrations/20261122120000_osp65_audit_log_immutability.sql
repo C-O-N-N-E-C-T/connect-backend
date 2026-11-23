@@ -6,7 +6,8 @@
 --      UPDATE ederdi (aşağıdaki trigger bunu engeller). Actor id zaten log'da kalmalıdır.
 --   2. Hiç kimse audit_logs üzerinde UPDATE, DELETE veya TRUNCATE yapamaz. İstemciler (anon,
 --      authenticated) INSERT de yapamaz; audit satırlarını yalnızca backend (service_role) ve
---      OSP-60 / OSP-67 SQL fonksiyonları yazar. İstemcilerin SELECT'i RLS'e bağlı kalır (OSP-63).
+--      OSP-60 / OSP-65 / OSP-67 SQL fonksiyonları yazar. anon hiç okuyamaz; authenticated'ın
+--      SELECT'i RLS'e bağlı kalır (OSP-63).
 --   3. BEFORE UPDATE OR DELETE (satır) ve BEFORE TRUNCATE (statement) trigger'ları hata
 --      fırlatır; service_role ve SECURITY DEFINER fonksiyonlar için de geçerlidir.
 --
@@ -35,8 +36,13 @@ END;
 $$;
 
 -- 2. Yetkiler -----------------------------------------------------------------------------
-REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.audit_logs FROM PUBLIC, anon, authenticated;
-REVOKE UPDATE, DELETE, TRUNCATE ON public.audit_logs FROM service_role;
+-- Önce her şey kaldırılır (TRIGGER / REFERENCES gibi gereksiz yetkiler de), sonra yalnızca
+-- gerekenler verilir:
+--   - authenticated: SELECT (hangi satırları göreceği OSP-63 RLS policy'lerine bağlı)
+--   - service_role:  SELECT, INSERT
+--   - anon:          hiçbir şey
+REVOKE ALL ON public.audit_logs FROM PUBLIC, anon, authenticated, service_role;
+GRANT SELECT ON public.audit_logs TO authenticated;
 GRANT SELECT, INSERT ON public.audit_logs TO service_role;
 
 -- 3. Trigger fonksiyonu -------------------------------------------------------------------

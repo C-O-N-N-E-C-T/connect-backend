@@ -14,8 +14,15 @@ const code = sql.replace(/--.*$/gm, '');
 
 describe('OSP-65 migration: append-only audit_logs', () => {
   it('runs after the OSP-58, OSP-60 and OSP-67 migrations', () => {
+    // "En son dosya" değil: sonradan eklenen migration'lar (OSP-63, OSP-66, ...) testi kırmaz.
     const files = fs.readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
-    expect(files.at(-1)).toBe(FILE);
+    const at = files.indexOf(FILE);
+    expect(at).toBeGreaterThanOrEqual(0);
+    for (const prefix of ['_osp58_', '_osp60_', '_osp67_']) {
+      const deps = files.filter((f) => f.includes(prefix));
+      expect(deps.length, `${prefix} migration not found`).toBeGreaterThan(0);
+      for (const dep of deps) expect(files.indexOf(dep)).toBeLessThan(at);
+    }
   });
 
   it('drops the actor_user_id foreign key (ON DELETE SET NULL would UPDATE audit rows)', () => {
@@ -24,18 +31,24 @@ describe('OSP-65 migration: append-only audit_logs', () => {
     expect(code).toMatch(/ALTER\s+TABLE\s+public\.audit_logs\s+DROP\s+CONSTRAINT/i);
   });
 
-  it('revokes INSERT/UPDATE/DELETE/TRUNCATE from PUBLIC, anon and authenticated', () => {
+  it('revokes ALL privileges first (no leftover TRIGGER / REFERENCES), from every role', () => {
     expect(code).toMatch(
-      /REVOKE\s+INSERT,\s*UPDATE,\s*DELETE,\s*TRUNCATE\s+ON\s+public\.audit_logs\s+FROM\s+PUBLIC,\s*anon,\s*authenticated\s*;/i,
+      /REVOKE\s+ALL\s+ON\s+public\.audit_logs\s+FROM\s+PUBLIC,\s*anon,\s*authenticated,\s*service_role\s*;/i,
     );
   });
 
-  it('leaves service_role with SELECT and INSERT only', () => {
-    expect(code).toMatch(
-      /REVOKE\s+UPDATE,\s*DELETE,\s*TRUNCATE\s+ON\s+public\.audit_logs\s+FROM\s+service_role\s*;/i,
+  it('then grants only SELECT to authenticated (RLS) and SELECT, INSERT to service_role', () => {
+    const grants = [...code.matchAll(/GRANT\s+([^;]*?)\s+ON\s+public\.audit_logs\s+TO\s+([^;]*?)\s*;/gi)].map(
+      (m) => [m[1]!.replace(/\s+/g, ' ').toUpperCase(), m[2]!.trim()],
     );
-    expect(code).toMatch(/GRANT\s+SELECT,\s*INSERT\s+ON\s+public\.audit_logs\s+TO\s+service_role\s*;/i);
-    expect(code).not.toMatch(/GRANT\s+[^;]*\b(UPDATE|DELETE|TRUNCATE|ALL)\b[^;]*ON\s+public\.audit_logs/i);
+    expect(grants).toEqual([
+      ['SELECT', 'authenticated'],
+      ['SELECT, INSERT', 'service_role'],
+    ]);
+    const revokeAt = code.search(/REVOKE\s+ALL\s+ON\s+public\.audit_logs/i);
+    const firstGrantAt = code.search(/GRANT\s+[^;]*ON\s+public\.audit_logs/i);
+    expect(revokeAt).toBeGreaterThanOrEqual(0);
+    expect(revokeAt).toBeLessThan(firstGrantAt);
   });
 
   it('defines the reject function with a fixed search_path and RAISE EXCEPTION', () => {
@@ -75,5 +88,63 @@ describe('OSP-65 migration: append-only audit_logs', () => {
     expect(others).not.toMatch(/UPDATE\s+public\.audit_logs/i);
     expect(others).not.toMatch(/DELETE\s+FROM\s+public\.audit_logs/i);
     expect(others).not.toMatch(/TRUNCATE\s+(TABLE\s+)?public\.audit_logs/i);
+  });
+});
+
+describe('OSP-65 migration: victim writes and their audit rows are atomic', () => {
+  const ATOMIC = '20261123120000_osp65_atomic_victim_writes.sql';
+  const atomic = fs.readFileSync(path.join(MIGRATIONS, ATOMIC), 'utf8').replace(/--.*$/gm, '');
+  const body = (name: string) => {
+    const m = atomic.match(
+      new RegExp(`CREATE\\s+OR\\s+REPLACE\\s+FUNCTION\\s+public\\.${name}\\(([\\s\\S]*?)\\$\\$([\\s\\S]*?)\\$\\$`, 'i'),
+    );
+    expect(m, `${name} not found`).not.toBeNull();
+    return { header: m![1]!, code: m![2]! };
+  };
+
+  it('runs after the append-only migration', () => {
+    const files = fs.readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
+    expect(files.indexOf(ATOMIC)).toBeGreaterThan(files.indexOf(FILE));
+  });
+
+  it('sync_observation_audited inserts the observation AND its OBSERVATION_SYNC row in one function', () => {
+    const fn = body('sync_observation_audited');
+    expect(fn.header).toMatch(/SET\s+search_path\s*=\s*''/i);
+    expect(fn.code).toMatch(/INSERT\s+INTO\s+public\.rescuer_observations/i);
+    expect(fn.code).toMatch(/INSERT\s+INTO\s+public\.audit_logs[\s\S]*'OBSERVATION_SYNC'/i);
+    // Hata yutulmaz: EXCEPTION bloğu olsaydı audit hatası yazımı geri almadan kaybolabilirdi.
+    expect(fn.code).not.toMatch(/\bEXCEPTION\b/i);
+  });
+
+  it('override_victim_audited locks the row, updates it AND writes VICTIM_UPDATE in one function', () => {
+    const fn = body('override_victim_audited');
+    expect(fn.header).toMatch(/SET\s+search_path\s*=\s*''/i);
+    expect(fn.code).toMatch(/FROM\s+public\.victim_records[\s\S]*FOR\s+UPDATE/i);
+    expect(fn.code).toMatch(/UPDATE\s+public\.victim_records/i);
+    expect(fn.code).toMatch(/INSERT\s+INTO\s+public\.audit_logs[\s\S]*'VICTIM_UPDATE'/i);
+    expect(fn.code).not.toMatch(/\bEXCEPTION\b/i);
+  });
+
+  it('never copies the free-text override reason into audit_logs (only has_reason)', () => {
+    const fn = body('override_victim_audited');
+    const auditInsert = fn.code.slice(fn.code.search(/INSERT\s+INTO\s+public\.audit_logs/i));
+    expect(auditInsert).toMatch(/'has_reason',\s*p_reason\s+IS\s+NOT\s+NULL/i);
+    expect(auditInsert).not.toMatch(/'reason',\s*p_reason/i);
+  });
+
+  it.each(['sync_observation_audited', 'override_victim_audited'])(
+    '%s is executable by service_role only',
+    (name) => {
+      expect(atomic).toMatch(new RegExp(`REVOKE\\s+ALL\\s+ON\\s+FUNCTION\\s+public\\.${name}\\([^)]*\\)\\s+FROM\\s+PUBLIC\\s*;`, 'i'));
+      expect(atomic).toMatch(
+        new RegExp(`REVOKE\\s+EXECUTE\\s+ON\\s+FUNCTION\\s+public\\.${name}\\([^)]*\\)\\s+FROM\\s+anon,\\s*authenticated\\s*;`, 'i'),
+      );
+      expect(atomic).toMatch(new RegExp(`GRANT\\s+EXECUTE\\s+ON\\s+FUNCTION\\s+public\\.${name}\\([^)]*\\)\\s+TO\\s+service_role\\s*;`, 'i'));
+    },
+  );
+
+  it('never modifies or deletes audit rows', () => {
+    expect(atomic).not.toMatch(/UPDATE\s+public\.audit_logs/i);
+    expect(atomic).not.toMatch(/DELETE\s+FROM\s+public\.audit_logs/i);
   });
 });

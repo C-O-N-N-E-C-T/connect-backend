@@ -74,16 +74,20 @@ export function registerBusinessRoutes(
   audit: VictimAudit = victimAudit,
 ): void {
   // OSP-65 (AC-28): başarılı her kazazede verisi cevabından önce audit satırı yazılmış olmalı;
-  // yazılmamışsa requireVictimAudit 2xx cevabı 500'e çevirir. /assignments hiçbir şey
-  // kaydetmediği (stub) için şimdilik audit edilmez.
+  // yazılmamışsa requireVictimAudit 2xx cevabı 500'e çevirir. Yazma uçlarında (/sync,
+  // override) audit satırını store, değişiklikle aynı DB transaction'ında yazar.
+  // TODO(OSP-65 / atama tablosu): /assignments şu an hiçbir şey kaydetmediği (stub,
+  // persisted: false) için audit edilmez. Atama kalıcı kaydedilmeye başladığında bu uç da
+  // yazımla aynı transaction'da bir audit satırı yazmalı ve enforcer'a eklenmelidir.
   router.use(['/sync', '/victims'], requireVictimAudit);
 
   // Express 5: async handler'ın fırlattığı hata otomatik olarak errorHandler'a gider.
   router.post('/sync', requireRole('rescuer'), async (req: Request, res: Response) => {
     const auth = authOf(req);
     const body = parseBody(syncBodySchema, req.body);
-    const observation = await store.insertObservation(body.payload, auth.user_id);
-    await audit.sync(req, observation.id);
+    // Gözlem + OBSERVATION_SYNC tek transaction'da; audit yazılamazsa gözlem de kaydedilmez.
+    const observation = await store.insertObservation(body.payload, auth);
+    audit.recordedByStore(req);
     res.status(201).json({ observation });
   });
 
@@ -121,11 +125,12 @@ export function registerBusinessRoutes(
       const id = parseVictimId(req);
       const body = parseBody(victimOverrideBodySchema, req.body);
       // Doğrulanan gerekçe (varsa) atılmaz; store `_override.reason` olarak kaydeder.
-      const victim = await store.overrideVictim(id, body.payload, auth.user_id, {
+      // Güncelleme + VICTIM_UPDATE tek transaction'da; audit satırına gerekçe metni yazılmaz.
+      const victim = await store.overrideVictim(id, body.payload, auth, {
         reason: body.reason,
       });
       if (!victim) throw victimNotFoundError();
-      await audit.override(req, victim.id, { reason: body.reason });
+      audit.recordedByStore(req);
       res.status(200).json({ victim });
     },
   );

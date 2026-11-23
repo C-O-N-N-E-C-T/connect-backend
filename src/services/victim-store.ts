@@ -2,16 +2,25 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { supabaseAdmin } from '../config/supabase.js';
 import type { RescuerObservation, VictimRecord } from '../types/database.js';
 import { AppError } from '../types/errors.js';
+import type { AuthContext } from '../types/express.js';
 
 /**
  * OSP-62: Stub iş uçlarının veri erişim katmanı.
  * Route'lar veritabanına doğrudan değil bu arayüz üzerinden erişir; böylece testler bellekte
  * duran sahte bir store enjekte eder (`createApp({ victimStore })`) ve hiçbir test gerçek
  * (paylaşılan) Supabase projesine dokunmaz.
+ *
+ * OSP-65 (AC-28): YAZMA metotları (`overrideVictim`, `insertObservation`) audit satırını da
+ * aynı DB transaction'ında yazar (SQL fonksiyonları, migration
+ * `20261123120000_osp65_atomic_victim_writes.sql`). Audit yazılamazsa değişiklik de geri alınır
+ * ve metot 500 fırlatır. Okuma metotları audit yazmaz; onu route `victimAudit` ile yapar.
  */
 /** Override'a eşlik eden ek bilgiler. */
 export interface OverrideOptions {
-  /** Koordinatörün override gerekçesi; verilirse `_override.reason` olarak saklanır. */
+  /**
+   * Koordinatörün override gerekçesi; verilirse `_override.reason` olarak kayıtta saklanır.
+   * Audit satırına metin değil, yalnızca `has_reason` yazılır.
+   */
   reason?: string | undefined;
 }
 
@@ -19,16 +28,17 @@ export interface VictimStore {
   listVictims(): Promise<VictimRecord[]>;
   /** Kayıt yoksa `null`. */
   getVictim(id: string): Promise<VictimRecord | null>;
-  /** Kayıt yoksa `null`; varsa güncel kayıt. */
+  /** Kayıt yoksa `null` (hiçbir şey yazılmaz); varsa güncel kayıt + VICTIM_UPDATE audit satırı. */
   overrideVictim(
     id: string,
     payload: Record<string, unknown>,
-    actorUserId: string,
+    actor: AuthContext,
     options?: OverrideOptions,
   ): Promise<VictimRecord | null>;
+  /** Gözlem + OBSERVATION_SYNC audit satırı, tek transaction'da. */
   insertObservation(
     payload: Record<string, unknown>,
-    actorUserId: string,
+    actor: AuthContext,
   ): Promise<RescuerObservation>;
 }
 
@@ -45,17 +55,9 @@ const storeError = () =>
  * rollerine bu tabloları kapattığı için service-role client gerekir; yetki kontrolü
  * (rol) bu katmana gelmeden `requireRole` ile yapılmış olur.
  */
-export function createSupabaseVictimStore(client: Pick<SupabaseClient, 'from'>): VictimStore {
-  async function getVictim(id: string): Promise<VictimRecord | null> {
-    const { data, error } = await client
-      .from('victim_records')
-      .select(RECORD_COLUMNS)
-      .eq('id', id)
-      .maybeSingle<VictimRecord>();
-    if (error) throw storeError();
-    return data ?? null;
-  }
-
+export function createSupabaseVictimStore(
+  client: Pick<SupabaseClient, 'from' | 'rpc'>,
+): VictimStore {
   return {
     async listVictims() {
       const { data, error } = await client
@@ -68,43 +70,40 @@ export function createSupabaseVictimStore(client: Pick<SupabaseClient, 'from'>):
       return data ?? [];
     },
 
-    getVictim,
-
-    async overrideVictim(id, payload, actorUserId, options = {}) {
-      // STUB: önce oku, sonra birleştirip yaz. İki adım atomik değildir; eşzamanlı override'lar
-      // birbirini ezebilir. Gerçek override modeli (sürümleme/denetim kaydı) E9'da gelecek.
-      const existing = await getVictim(id);
-      if (!existing) return null;
-      const merged = {
-        ...existing.payload,
-        ...payload,
-        // Son override'ı kimin/ne zaman yaptığı kayıt içinde izlenebilsin.
-        _override: {
-          by: actorUserId,
-          at: new Date().toISOString(),
-          // Gerekçe yalnızca verildiyse yazılır (boş alan bırakılmaz).
-          ...(options.reason !== undefined ? { reason: options.reason } : {}),
-        },
-      };
+    async getVictim(id) {
       const { data, error } = await client
         .from('victim_records')
-        .update({ payload: merged })
-        .eq('id', id)
         .select(RECORD_COLUMNS)
+        .eq('id', id)
         .maybeSingle<VictimRecord>();
       if (error) throw storeError();
       return data ?? null;
     },
 
-    async insertObservation(payload, actorUserId) {
+    async overrideVictim(id, payload, actor, options = {}) {
+      // Oku + birleştir + yaz + audit tek SQL fonksiyonunda (satır FOR UPDATE ile kilitli).
+      const { data, error } = await client.rpc('override_victim_audited', {
+        p_victim_id: id,
+        p_actor_user_id: actor.user_id,
+        p_actor_role: actor.role,
+        p_device_id: actor.device_id,
+        p_payload: payload,
+        p_reason: options.reason ?? null,
+      });
+      if (error) throw storeError();
+      return (data as VictimRecord | null) ?? null;
+    },
+
+    async insertObservation(payload, actor) {
       // created_by her zaman doğrulanmış kimlikten (req.auth.user_id) gelir, gövdeden değil.
-      const { data, error } = await client
-        .from('rescuer_observations')
-        .insert({ payload, created_by: actorUserId })
-        .select(RECORD_COLUMNS)
-        .single<RescuerObservation>();
+      const { data, error } = await client.rpc('sync_observation_audited', {
+        p_actor_user_id: actor.user_id,
+        p_actor_role: actor.role,
+        p_device_id: actor.device_id,
+        p_payload: payload,
+      });
       if (error || !data) throw storeError();
-      return data;
+      return data as RescuerObservation;
     },
   };
 }
@@ -121,8 +120,7 @@ function getDefaultStore(): VictimStore {
 export const defaultVictimStore: VictimStore = {
   listVictims: () => getDefaultStore().listVictims(),
   getVictim: (id) => getDefaultStore().getVictim(id),
-  overrideVictim: (id, payload, actorUserId, options) =>
-    getDefaultStore().overrideVictim(id, payload, actorUserId, options),
-  insertObservation: (payload, actorUserId) =>
-    getDefaultStore().insertObservation(payload, actorUserId),
+  overrideVictim: (id, payload, actor, options) =>
+    getDefaultStore().overrideVictim(id, payload, actor, options),
+  insertObservation: (payload, actor) => getDefaultStore().insertObservation(payload, actor),
 };

@@ -121,28 +121,61 @@ export function victim(overrides: Partial<VictimRecord> = {}): VictimRecord {
   };
 }
 
-/** src/services/victim-store.ts ile aynı sözleşmeye sahip, bellekte duran VictimStore. */
-export function fakeVictimStore(initial: VictimRecord[] = [victim()]): VictimStore {
-  const records = [...initial];
+/**
+ * src/services/victim-store.ts ile aynı sözleşmeye sahip, bellekte duran VictimStore.
+ *
+ * Yazma metotları gerçek SQL fonksiyonları gibi davranır: yeni durum hesaplanır, audit
+ * satırı `audit` store'una yazılır ve değişiklik ANCAK audit başarılı olursa uygulanır
+ * (audit hata verirse transaction geri alınmış gibi hiçbir şey değişmez).
+ */
+export interface FakeVictimStore extends VictimStore {
+  records: VictimRecord[];
+  observations: RescuerObservation[];
+}
+
+export function fakeVictimStore(
+  initial: VictimRecord[] = [victim()],
+  audit: AuditLogStore = fakeAuditStore(),
+): FakeVictimStore {
+  const records = initial.map((r) => ({ ...r, payload: { ...r.payload } }));
+  const observations: RescuerObservation[] = [];
   return {
+    records,
+    observations,
     async listVictims() {
-      return [...records];
+      return records.map((r) => ({ ...r }));
     },
     async getVictim(id) {
-      return records.find((r) => r.id === id) ?? null;
+      const record = records.find((r) => r.id === id);
+      return record ? { ...record } : null;
     },
-    async overrideVictim(id, payload, actorUserId, options = {}) {
+    async overrideVictim(id, payload, actor, options = {}) {
       const record = records.find((r) => r.id === id);
       if (!record) return null;
-      record.payload = {
+      const merged = {
         ...record.payload,
         ...payload,
-        _override: { by: actorUserId, ...(options.reason !== undefined ? { reason: options.reason } : {}) },
+        _override: { by: actor.user_id, ...(options.reason !== undefined ? { reason: options.reason } : {}) },
       };
-      return record;
+      await audit.write({
+        actor,
+        action_type: 'VICTIM_UPDATE',
+        target_record_id: id,
+        metadata: { override: true, has_reason: options.reason !== undefined },
+      });
+      record.payload = merged;
+      return { ...record };
     },
-    async insertObservation(payload, actorUserId): Promise<RescuerObservation> {
-      return { id: OBSERVATION_ID, created_at: '2026-11-22T10:00:00+00:00', created_by: actorUserId, payload };
+    async insertObservation(payload, actor): Promise<RescuerObservation> {
+      const observation = {
+        id: OBSERVATION_ID,
+        created_at: '2026-11-22T10:00:00+00:00',
+        created_by: actor.user_id,
+        payload,
+      };
+      await audit.write({ actor, action_type: 'OBSERVATION_SYNC', target_record_id: observation.id });
+      observations.push(observation);
+      return observation;
     },
   };
 }
