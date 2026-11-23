@@ -16,6 +16,8 @@ export const AUDIT_ACTION_TYPES = [
   'VICTIM_VIEW',
   'VICTIM_UPDATE',
   'RETENTION_PURGE',
+  // OSP-65: POST /api/v1/sync bir kurtarıcı gözlemi kaydetti (target_record_id = gözlem id'si).
+  'OBSERVATION_SYNC',
 ] as const;
 
 
