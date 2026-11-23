@@ -12,6 +12,7 @@ export type ErrorCode =
   | 'HTTPS_REQUIRED'
   | 'VALIDATION_ERROR'
   | 'NOT_FOUND'
+  | 'CONFLICT'
   | 'INTERNAL_ERROR';
 
 export interface ErrorResponsePayload {
