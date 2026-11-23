@@ -2,12 +2,14 @@ import type { NextFunction, Request, RequestHandler, Response, Router } from 'ex
 import type { ZodType } from 'zod';
 import { unauthenticatedError } from '../middleware/auth.js';
 import { requireRole } from '../middleware/require-role.js';
+import { requireVictimAudit } from '../middleware/victim-audit-enforcer.js';
 import {
   assignmentBodySchema,
   syncBodySchema,
   victimIdParamSchema,
   victimOverrideBodySchema,
 } from '../schemas/business.js';
+import { victimAudit, type VictimAudit } from '../services/victim-audit.js';
 import type { VictimStore } from '../services/victim-store.js';
 import { AppError } from '../types/errors.js';
 import type { AuthContext } from '../types/express.js';
@@ -66,12 +68,22 @@ function authOf(req: Request): AuthContext {
   return req.auth;
 }
 
-export function registerBusinessRoutes(router: Router, store: VictimStore): void {
+export function registerBusinessRoutes(
+  router: Router,
+  store: VictimStore,
+  audit: VictimAudit = victimAudit,
+): void {
+  // OSP-65 (AC-28): başarılı her kazazede verisi cevabından önce audit satırı yazılmış olmalı;
+  // yazılmamışsa requireVictimAudit 2xx cevabı 500'e çevirir. /assignments hiçbir şey
+  // kaydetmediği (stub) için şimdilik audit edilmez.
+  router.use(['/sync', '/victims'], requireVictimAudit);
+
   // Express 5: async handler'ın fırlattığı hata otomatik olarak errorHandler'a gider.
   router.post('/sync', requireRole('rescuer'), async (req: Request, res: Response) => {
     const auth = authOf(req);
     const body = parseBody(syncBodySchema, req.body);
     const observation = await store.insertObservation(body.payload, auth.user_id);
+    await audit.sync(req, observation.id);
     res.status(201).json({ observation });
   });
 
@@ -79,8 +91,10 @@ export function registerBusinessRoutes(router: Router, store: VictimStore): void
     '/victims',
     requireRole('coordinator', 'administrator'),
     noStore,
-    async (_req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const victims = await store.listVictims();
+      // Liste için TEK bir özet satırı (kayıt başına bir satır değil).
+      await audit.list(req, { result_count: victims.length });
       res.status(200).json({ victims });
     },
   );
@@ -93,6 +107,7 @@ export function registerBusinessRoutes(router: Router, store: VictimStore): void
       const id = parseVictimId(req);
       const victim = await store.getVictim(id);
       if (!victim) throw victimNotFoundError();
+      await audit.view(req, victim.id);
       res.status(200).json({ victim });
     },
   );
@@ -110,6 +125,7 @@ export function registerBusinessRoutes(router: Router, store: VictimStore): void
         reason: body.reason,
       });
       if (!victim) throw victimNotFoundError();
+      await audit.override(req, victim.id, { reason: body.reason });
       res.status(200).json({ victim });
     },
   );

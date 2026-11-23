@@ -188,6 +188,8 @@ beforeEach(() => {
   app = createApp({
     authGuardDeps: fakeGuardDeps(),
     victimStore: store,
+        // OSP-65: kazazede verisi uçları artık audit satırı yazıyor; bellekte tut (gerçek DB yok).
+    auditLogStore: { write: async () => undefined },
     registerProtectedRoutes: registerTestAdminRoute,
   });
 });
