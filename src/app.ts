@@ -11,6 +11,7 @@ import {
   jsonBody,
 } from './routes/api-v1.js';
 import { defaultSessionStore, type SessionStore } from './services/session-store.js';
+import type { VictimStore } from './services/victim-store.js';
 import { AppError, type ErrorResponsePayload } from './types/errors.js';
 
 /** Test seams only; production calls `createApp()` without options. */
@@ -27,6 +28,8 @@ export interface AppOptions {
   sessionStore?: SessionStore;
   /** Registers extra routes on the protected /api/v1 router (the production extension point). */
   registerProtectedRoutes?: (router: Router) => void;
+  /** OSP-62: stub iş uçlarının veri erişimi; testler bellekte duran sahte store verir. */
+  victimStore?: VictimStore;
 }
 
 export function createApp(options: AppOptions = {}) {
@@ -80,7 +83,10 @@ export function createApp(options: AppOptions = {}) {
   app.use('/api/v1/auth', createAuthRateLimiter());
   app.use(createPublicApiRouter(auth, sessionStore));
 
-  const protectedApiRouter = createProtectedApiRouter(sessionStore);
+  const protectedApiRouter = createProtectedApiRouter({
+    sessionStore,
+    victimStore: options.victimStore,
+  });
   options.registerProtectedRoutes?.(protectedApiRouter);
   app.use('/api/v1', auth.requireAuth, jsonBody, protectedApiRouter);
 

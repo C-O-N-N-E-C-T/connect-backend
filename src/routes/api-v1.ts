@@ -6,9 +6,11 @@ import express, {
   type Response,
 } from 'express';
 import type { AuthGuard } from '../middleware/auth.js';
-import type { SessionStore } from '../services/session-store.js';
+import { defaultSessionStore, type SessionStore } from '../services/session-store.js';
+import { defaultVictimStore, type VictimStore } from '../services/victim-store.js';
 import { AppError } from '../types/errors.js';
 import { createLogoutHandler, createSessionHandler } from './auth.js';
+import { registerBusinessRoutes } from './business.js';
 
 const parseJson = express.json({ limit: '1mb' });
 
@@ -85,11 +87,20 @@ export function createPublicApiRouter(auth: AuthGuard, sessionStore: SessionStor
  * `jsonBody`, so every handler can rely on `req.auth` and a parsed JSON body.
  * Never mount routes for /api/v1 anywhere else.
  */
-export function createProtectedApiRouter(sessionStore: SessionStore): Router {
+export function createProtectedApiRouter(options: ProtectedApiRouterOptions = {}): Router {
   const router = Router();
 
   // OSP-60: clears this session's device binding and writes LOGOUT. 204, no body.
-  router.post('/auth/logout', createLogoutHandler(sessionStore));
+  router.post('/auth/logout', createLogoutHandler(options.sessionStore ?? defaultSessionStore));
 
+  // OSP-62: rol korumalı stub iş uçları; store verilmezse gerçek (Supabase) store kullanılır.
+  registerBusinessRoutes(router, options.victimStore ?? defaultVictimStore);
   return router;
+}
+
+/** OSP-62: korumalı router bağımlılıkları (test enjeksiyonu için opsiyonel obje). */
+export interface ProtectedApiRouterOptions {
+  /** OSP-60: /auth/logout store; verilmezse gerçek (Supabase) store kullanılır. */
+  sessionStore?: SessionStore;
+  victimStore?: VictimStore;
 }
