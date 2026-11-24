@@ -12,6 +12,7 @@ import {
 } from './routes/api-v1.js';
 import { defaultSessionStore, type SessionStore } from './services/session-store.js';
 import type { AuditLogStore } from './services/audit-log.js';
+import type { AdminStore, AuthAdminPort } from './services/admin-store.js';
 import type { VictimStore } from './services/victim-store.js';
 import { AppError, type ErrorResponsePayload } from './types/errors.js';
 
@@ -33,6 +34,10 @@ export interface AppOptions {
   victimStore?: VictimStore;
   /** OSP-65: kazazede verisi uçlarının audit store'u; testler bellekte duran sahte store verir. */
   auditLogStore?: AuditLogStore;
+  /** OSP-66: yönetici uçlarının store'u; testler bellekte duran sahte store verir. */
+  adminStore?: AdminStore;
+  /** OSP-66: yönetici uçlarının Auth port'u; testler sahte port verir. */
+  authAdmin?: AuthAdminPort;
 }
 
 export function createApp(options: AppOptions = {}) {
@@ -90,6 +95,8 @@ export function createApp(options: AppOptions = {}) {
     sessionStore,
     victimStore: options.victimStore,
     auditLogStore: options.auditLogStore,
+    adminStore: options.adminStore,
+    authAdmin: options.authAdmin,
   });
   options.registerProtectedRoutes?.(protectedApiRouter);
   app.use('/api/v1', auth.requireAuth, jsonBody, protectedApiRouter);

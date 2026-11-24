@@ -60,6 +60,22 @@ Node.js + Express + TypeScript backend API and Supabase CLI migrations for the *
 
 Until `/auth/session` succeeds, every guarded request with that token gets `403 SESSION_NOT_BOUND`. Full contract and error codes: [docs/osp-60-auth-session.md](docs/osp-60-auth-session.md).
 
+## Administrator Endpoints (OSP-66)
+
+All of these require a token whose user has `role = 'administrator'`. Other roles get `403 ROLE_FORBIDDEN`.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/admin/users?limit&offset` | List accounts (paged, newest first). |
+| `POST /api/v1/admin/users` | Create a `rescuer` or `coordinator` account. `administrator` is refused with `403 ROLE_FORBIDDEN`. |
+| `GET /api/v1/admin/users/:id/devices` | Devices of a user. Session ids are never returned. |
+| `POST /api/v1/admin/users/:id/devices/:deviceId/revoke` | Revoke one device. Its next call gets `403 DEVICE_REVOKED`; other devices are unaffected. |
+| `POST /api/v1/admin/users/:id/revoke-all` | Disable the account and delete all its sessions. Its calls get `403 ACCOUNT_DISABLED`. Refused for your own account (`409`). |
+| `POST /api/v1/admin/users/:id/reactivate` | Re-enable a disabled account. Tokens issued before the disable stay invalid. |
+| `GET /api/v1/admin/audit-logs` | Filter by `action_type`, `actor_user_id`, `target_record_id`, `from`, `to`; paged. |
+
+Design, database functions and the manual verification steps: [docs/osp-66-admin-api.md](docs/osp-66-admin-api.md).
+
 ## Deployment (Render)
 
 1. **Create a Web Service** in Render from this repository (Node runtime, `26.x` or `24.x` to match `.nvmrc`).

@@ -7,11 +7,13 @@ import express, {
 } from 'express';
 import type { AuthGuard } from '../middleware/auth.js';
 import type { AuditLogStore } from '../services/audit-log.js';
+import { defaultAdminStore, defaultAuthAdmin, type AdminStore, type AuthAdminPort } from '../services/admin-store.js';
 import { defaultSessionStore, type SessionStore } from '../services/session-store.js';
 import { createVictimAudit, victimAudit } from '../services/victim-audit.js';
 import { defaultVictimStore, type VictimStore } from '../services/victim-store.js';
 import { AppError } from '../types/errors.js';
 import { createLogoutHandler, createSessionHandler } from './auth.js';
+import { registerAdminRoutes } from './admin.js';
 import { registerBusinessRoutes } from './business.js';
 
 const parseJson = express.json({ limit: '1mb' });
@@ -102,6 +104,12 @@ export function createProtectedApiRouter(options: ProtectedApiRouterOptions = {}
     options.victimStore ?? defaultVictimStore,
     options.auditLogStore ? createVictimAudit(options.auditLogStore) : victimAudit,
   );
+
+  // OSP-66: yönetici uçları; testler sahte store / Auth port verir, üretim Supabase kullanır.
+  registerAdminRoutes(router, {
+    store: options.adminStore ?? defaultAdminStore,
+    authAdmin: options.authAdmin ?? defaultAuthAdmin,
+  });
   return router;
 }
 
@@ -112,4 +120,8 @@ export interface ProtectedApiRouterOptions {
   victimStore?: VictimStore;
   /** OSP-65: kazazede verisi uçlarının audit store'u; verilmezse gerçek audit_logs tablosu. */
   auditLogStore?: AuditLogStore;
+  /** OSP-66: yönetici uçlarının veri erişimi; verilmezse gerçek (Supabase) store. */
+  adminStore?: AdminStore;
+  /** OSP-66: yönetici uçlarının Supabase Auth erişimi; verilmezse gerçek auth.admin. */
+  authAdmin?: AuthAdminPort;
 }
