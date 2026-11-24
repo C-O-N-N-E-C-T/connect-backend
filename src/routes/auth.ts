@@ -149,3 +149,19 @@ export function createLogoutHandler(store: SessionStore): RequestHandler {
     res.status(204).end();
   };
 }
+
+/**
+ * OSP-70 `GET /api/v1/auth/me`: answers `{ user_id, role, device_id }` from the guard's auth
+ * context (role from the database, not the JWT). Never returns `session_id` or token material,
+ * reads no body, writes no audit row. `Cache-Control: no-store` keeps it out of any cache.
+ */
+export function createMeHandler(): RequestHandler {
+  return (req: Request, res: Response) => {
+    const auth = req.auth;
+    // Cannot happen behind requireAuth; fail closed if the route is ever mounted elsewhere.
+    if (!auth) throw new AppError(500, 'INTERNAL_ERROR', 'An unexpected internal server error occurred.');
+
+    res.set('Cache-Control', 'no-store');
+    res.status(200).json({ user_id: auth.user_id, role: auth.role, device_id: auth.device_id });
+  };
+}

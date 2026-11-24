@@ -12,7 +12,7 @@ import { defaultSessionStore, type SessionStore } from '../services/session-stor
 import { createVictimAudit, victimAudit } from '../services/victim-audit.js';
 import { defaultVictimStore, type VictimStore } from '../services/victim-store.js';
 import { AppError } from '../types/errors.js';
-import { createLogoutHandler, createSessionHandler } from './auth.js';
+import { createLogoutHandler, createMeHandler, createSessionHandler } from './auth.js';
 import { registerAdminRoutes } from './admin.js';
 import { registerBusinessRoutes } from './business.js';
 
@@ -96,6 +96,12 @@ export function createProtectedApiRouter(options: ProtectedApiRouterOptions = {}
 
   // OSP-60: clears this session's device binding and writes LOGOUT. 204, no body.
   router.post('/auth/logout', createLogoutHandler(options.sessionStore ?? defaultSessionStore));
+
+  // OSP-70 (user decision 'option 2', 2026-11-25): lightweight session check for the web
+  // dashboard so a revoked device/account is detected on the next call (AC-19). Chosen instead
+  // of pinging GET /victims, which writes a victim-access audit row on every call (OSP-65/AC-28),
+  // or /admin/users, which returns user data. Behind the OSP-61 guard; no audit row, no body.
+  router.get('/auth/me', createMeHandler());
 
   // OSP-62: rol korumalı stub iş uçları; store verilmezse gerçek (Supabase) store kullanılır.
   // OSP-65: audit satırları verilen store'a (testler) veya gerçek audit_logs tablosuna gider.
