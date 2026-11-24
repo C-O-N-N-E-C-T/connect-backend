@@ -56,7 +56,8 @@ The grant is **unsigned**. `expires_at` is exactly `authenticated_at + 72 h`.
 | 4 | `(user_id, device_id)` row is not revoked | 403 `DEVICE_REVOKED` | `LOGIN_REJECTED` |
 | 5 | Bind and write the LOGIN audit row (one DB transaction) | 500 `INTERNAL_ERROR` on DB error | `LOGIN` |
 
-The `/api/v1/auth/*` rate limit is 10 requests per minute per IP and answers 429 `RATE_LIMITED`.
+The `/api/v1/auth/*` rate limit is 10 requests per minute per IP and answers 429 `RATE_LIMITED`
+(`GET /api/v1/auth/me` is exempt, see below).
 
 **Binding rules** (implemented by `public.bind_device_session`):
 
@@ -95,7 +96,9 @@ Authorization: Bearer <supabase access_token>
   detected on the next call through the guard's errors: 401 `UNAUTHENTICATED`, 403
   `ACCOUNT_DISABLED` / `SESSION_NOT_BOUND` / `DEVICE_REVOKED`, 429 `RATE_LIMITED`, 500
   `INTERNAL_ERROR`, all as `{ error_code, message }`.
-- It lives under `/api/v1/auth/*`, so it shares the 10 requests per minute per IP rate limit.
+- It lives under `/api/v1/auth/*` but is exempt from the OSP-64 rate limit (exact `GET /api/v1/auth/me`
+  only; other methods/lookalike paths still count). Team decision 2026-11-25: dashboard checks must
+  not use up the login budget behind a shared NAT. It is guarded like every protected endpoint.
 - Other methods on this path are not routes (guarded, then 404).
 
 ### Database objects
@@ -156,4 +159,6 @@ Supabase girişi başarılı olur olmaz çağrılır. Gövde `{device_id, device
   `{user_id, role, device_id}` döner (değerler guard'ın auth bağlamından, rol veritabanından).
   `session_id` ve token bilgisi dönmez, audit kaydı yazılmaz.
 - Web paneli için hafif oturum kontrolüdür (AC-19). İptal edilmiş cihaz/hesap guard hatalarıyla
-  (401 / 403) anlaşılır. `/api/v1/auth/*` altında olduğu için dakikada 10 istek/IP sınırına tabidir.
+  (401 / 403) anlaşılır. `/api/v1/auth/*` altında olduğu halde OSP-64 hız sınırından muaftır (yalnızca tam
+  `GET /api/v1/auth/me`; diğer metotlar ve benzer yollar sayılır). Ekip kararı (2026-11-25): ortak NAT
+  arkasında panel kontrolleri giriş kotasını tüketmesin.

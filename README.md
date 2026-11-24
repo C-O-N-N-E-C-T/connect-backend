@@ -49,7 +49,7 @@ Node.js + Express + TypeScript backend API and Supabase CLI migrations for the *
 - **HTTPS (NFR-SEC-02, AC-19):** In production, plain HTTP requests are rejected with `426 Upgrade Required`. TLS is terminated by Render, not by the app.
 - **HSTS:** Responses include `Strict-Transport-Security` with a one-year max-age and `includeSubDomains`.
 - **CORS:** Only `CORS_ORIGIN` receives an `Access-Control-Allow-Origin` header.
-- **Rate limiting:** `/api/v1/auth/*` allows 10 requests per minute per client IP. Exceeding it returns `429 RATE_LIMITED`. The counter is in memory, so it applies per running instance.
+- **Rate limiting:** `/api/v1/auth/*` allows 10 requests per minute per client IP. Exceeding it returns `429 RATE_LIMITED`. The counter is in memory, so it applies per running instance. Exception: `GET /api/v1/auth/me` (OSP-70 dashboard session check) is not counted.
 
 ## Auth Endpoints (OSP-60)
 
@@ -57,7 +57,7 @@ Node.js + Express + TypeScript backend API and Supabase CLI migrations for the *
 | --- | --- | --- |
 | `POST /api/v1/auth/session` | No (verifies the token itself) | Called right after Supabase sign-in with `{device_id, device_name}`. Binds the token's `session_id` to the device, writes a `LOGIN` audit row and returns `{user_id, role, device_id}`, plus a 72 h unsigned `offline_mission_grant` for rescuers. |
 | `POST /api/v1/auth/logout` | Yes | Clears this session's device binding and writes a `LOGOUT` audit row. `204`, no body. Call it before Supabase `signOut()`. |
-| `GET /api/v1/auth/me` | Yes | OSP-70 lightweight session check for the web dashboard. `200` `{user_id, role, device_id}` with `Cache-Control: no-store`; no audit row. A revoked device/account gets the guard's `403`. Counts toward the `/api/v1/auth/*` rate limit. |
+| `GET /api/v1/auth/me` | Yes | OSP-70 lightweight session check for the web dashboard. `200` `{user_id, role, device_id}` with `Cache-Control: no-store`; no audit row. A revoked device/account gets the guard's `403`. Exempt from the `/api/v1/auth/*` rate limit (exact `GET` only). |
 
 Until `/auth/session` succeeds, every guarded request with that token gets `403 SESSION_NOT_BOUND`. Full contract and error codes: [docs/osp-60-auth-session.md](docs/osp-60-auth-session.md).
 
