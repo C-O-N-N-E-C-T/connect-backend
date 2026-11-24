@@ -80,6 +80,24 @@ Authorization: Bearer <supabase access_token>
   In that case no LOGOUT row is written. The AC "100% audit" is read as "100% of authenticated
   calls" (team decision, see the PR).
 
+### `GET /api/v1/auth/me` (OSP-70)
+
+```http
+GET /api/v1/auth/me
+Authorization: Bearer <supabase access_token>
+```
+
+- Behind the OSP-61 guard. Answers **200** `Cache-Control: no-store` with exactly
+  `{ "user_id": "<uuid>", "role": "rescuer" | "coordinator" | "administrator", "device_id": "<uuid>" }`,
+  taken from the guard's auth context (the role comes from the database, not the JWT).
+  `session_id` and token material are never returned. No body is read and no audit row is written.
+- Purpose: a cheap session check for the web dashboard (AC-19). A revoked device or account is
+  detected on the next call through the guard's errors: 401 `UNAUTHENTICATED`, 403
+  `ACCOUNT_DISABLED` / `SESSION_NOT_BOUND` / `DEVICE_REVOKED`, 429 `RATE_LIMITED`, 500
+  `INTERNAL_ERROR`, all as `{ error_code, message }`.
+- It lives under `/api/v1/auth/*`, so it shares the 10 requests per minute per IP rate limit.
+- Other methods on this path are not routes (guarded, then 404).
+
 ### Database objects
 
 Migration `20261122100000_osp60_session_binding.sql`:
@@ -131,3 +149,11 @@ Supabase girişi başarılı olur olmaz çağrılır. Gövde `{device_id, device
 - Supabase `signOut()` çağrısından **önce** çağrılmalıdır.
 - Süresi dolmuş ya da iptal edilmiş token'ı guard reddeder ve LOGOUT kaydı yazılmaz. Kabul
   kriterindeki "%100 audit", "kimliği doğrulanmış çağrıların %100'ü" olarak okunur (ekip kararı, PR'a bakın).
+
+### `GET /api/v1/auth/me` (OSP-70)
+
+- Guard'ın arkasındadır. **200** ve `Cache-Control: no-store` ile tam olarak
+  `{user_id, role, device_id}` döner (değerler guard'ın auth bağlamından, rol veritabanından).
+  `session_id` ve token bilgisi dönmez, audit kaydı yazılmaz.
+- Web paneli için hafif oturum kontrolüdür (AC-19). İptal edilmiş cihaz/hesap guard hatalarıyla
+  (401 / 403) anlaşılır. `/api/v1/auth/*` altında olduğu için dakikada 10 istek/IP sınırına tabidir.

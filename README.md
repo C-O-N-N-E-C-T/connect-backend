@@ -57,6 +57,7 @@ Node.js + Express + TypeScript backend API and Supabase CLI migrations for the *
 | --- | --- | --- |
 | `POST /api/v1/auth/session` | No (verifies the token itself) | Called right after Supabase sign-in with `{device_id, device_name}`. Binds the token's `session_id` to the device, writes a `LOGIN` audit row and returns `{user_id, role, device_id}`, plus a 72 h unsigned `offline_mission_grant` for rescuers. |
 | `POST /api/v1/auth/logout` | Yes | Clears this session's device binding and writes a `LOGOUT` audit row. `204`, no body. Call it before Supabase `signOut()`. |
+| `GET /api/v1/auth/me` | Yes | OSP-70 lightweight session check for the web dashboard. `200` `{user_id, role, device_id}` with `Cache-Control: no-store`; no audit row. A revoked device/account gets the guard's `403`. Counts toward the `/api/v1/auth/*` rate limit. |
 
 Until `/auth/session` succeeds, every guarded request with that token gets `403 SESSION_NOT_BOUND`. Full contract and error codes: [docs/osp-60-auth-session.md](docs/osp-60-auth-session.md).
 
