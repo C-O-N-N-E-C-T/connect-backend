@@ -91,11 +91,11 @@ Authorization: Bearer <supabase access_token>
 - Behind the OSP-61 guard. Answers **200** `Cache-Control: no-store` with exactly
   `{ "user_id": "<uuid>", "role": "rescuer" | "coordinator" | "administrator", "device_id": "<uuid>" }`,
   taken from the guard's auth context (the role comes from the database, not the JWT).
-  `session_id` and token material are never returned. No body is read and no audit row is written.
+  `session_id` and token material are never returned. The handler reads no body (a malformed JSON
+  body is still rejected with 400 by `jsonBody`, like every protected route) and writes no audit row.
 - Purpose: a cheap session check for the web dashboard (AC-19). A revoked device or account is
   detected on the next call through the guard's errors: 401 `UNAUTHENTICATED`, 403
-  `ACCOUNT_DISABLED` / `SESSION_NOT_BOUND` / `DEVICE_REVOKED`, 429 `RATE_LIMITED`, 500
-  `INTERNAL_ERROR`, all as `{ error_code, message }`.
+  `ACCOUNT_DISABLED` / `SESSION_NOT_BOUND` / `DEVICE_REVOKED`, 500 `INTERNAL_ERROR`, all as `{ error_code, message }`.
 - It lives under `/api/v1/auth/*` but is exempt from the OSP-64 rate limit (exact `GET /api/v1/auth/me`
   only; other methods/lookalike paths still count). Team decision 2026-11-25: dashboard checks must
   not use up the login budget behind a shared NAT. It is guarded like every protected endpoint.
