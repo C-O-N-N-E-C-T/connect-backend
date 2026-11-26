@@ -85,3 +85,44 @@ describe('OSP-64: HTTPS/TLS, CORS and auth rate limiting', () => {
     });
   });
 });
+
+describe('OSP-70: GET /api/v1/auth/me is exempt from the auth rate limit', () => {
+  // createApp() gives each test its own limiter store.
+  it('does not count GET /auth/me, so logins keep their full budget', async () => {
+    const testApp = createApp();
+    for (let i = 0; i < 15; i++) {
+      // No token -> 401 from the guard, never 429.
+      const res = await request(testApp).get('/api/v1/auth/me');
+      expect(res.status).toBe(401);
+    }
+    for (let i = 0; i < 10; i++) {
+      const res = await request(testApp).post('/api/v1/auth/session');
+      expect(res.status).toBe(401);
+    }
+    const limited = await request(testApp).post('/api/v1/auth/session');
+    expect(limited.status).toBe(429);
+    expect(limited.body.error_code).toBe('RATE_LIMITED');
+  });
+
+  it('still counts other methods and lookalike paths', async () => {
+    const testApp = createApp();
+    const counted = [
+      () => request(testApp).post('/api/v1/auth/me'),
+      () => request(testApp).head('/api/v1/auth/me'),
+      () => request(testApp).get('/api/v1/auth/me/'),
+      () => request(testApp).get('/api/v1/auth/ME'),
+      () => request(testApp).get('/api/v1/auth/me/extra'),
+      () => request(testApp).get('/api/v1/auth/meta'),
+      () => request(testApp).get('/api/v1/auth/session'),
+      () => request(testApp).post('/api/v1/auth/logout'),
+      () => request(testApp).post('/api/v1/auth/me'),
+      () => request(testApp).post('/api/v1/auth/me'),
+    ];
+    for (const send of counted) {
+      const res = await send();
+      expect(res.status).not.toBe(429);
+    }
+    const limited = await request(testApp).get('/api/v1/auth/meta');
+    expect(limited.status).toBe(429);
+  });
+});
