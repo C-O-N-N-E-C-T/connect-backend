@@ -94,3 +94,4 @@ Design, database functions and the manual verification steps: [docs/osp-66-admin
 
 ## Documentation
 - [Supabase Project & Auth Settings (`docs/supabase-settings.md`)](./docs/supabase-settings.md)
+- [Deny-by-default RLS and table privileges, OSP-63 (`docs/osp-63-rls.md`)](./docs/osp-63-rls.md)
